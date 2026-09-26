@@ -25,6 +25,11 @@ import polars as pl
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = lambda x, **kwargs: x
+
 logger = logging.getLogger("blocking")
 if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
@@ -131,7 +136,11 @@ def gpu_sparse_dot_topk(
     matched_s1_list: List[np.ndarray] = []
     matched_pool_list: List[np.ndarray] = []
 
-    for i in range(0, n_s1, effective_batch_size):
+    for i in tqdm(
+        range(0, n_s1, effective_batch_size),
+        desc="GPU TF-IDF Batches",
+        leave=False,
+    ):
         end_idx = min(i + effective_batch_size, n_s1)
         chunk = M_s1[i:end_idx]
 
@@ -356,7 +365,7 @@ def _topk_from_csr(
     out_rows: List[np.ndarray] = []
     out_cols: List[np.ndarray] = []
 
-    for i in range(n_rows):
+    for i in tqdm(range(n_rows), desc="CPU Sparse Dot Top-K", leave=False, miniters=10000):
         start = indptr[i]
         end = indptr[i + 1]
         if start == end:
