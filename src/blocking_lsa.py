@@ -12,13 +12,12 @@ from typing import List, Tuple
 import numpy as np
 import polars as pl
 
+from sklearn.feature_extraction.text import TfidfVectorizer
 try:
-    from cuml.feature_extraction.text import TfidfVectorizer
     from cuml.decomposition import TruncatedSVD
     from cuml.neighbors import NearestNeighbors
     _HAS_CUML = True
 except ImportError:
-    from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.decomposition import TruncatedSVD
     from sklearn.neighbors import NearestNeighbors
     _HAS_CUML = False
@@ -108,10 +107,6 @@ def block_channel_tfidf_ngram(
     if not pool_exprs:
         return empty_res
 
-    if _HAS_CUML:
-        # cuml handles polars string columns slightly better if converted to cudf or pandas, but list of strings works in sklearn/cuml
-        pass
-
     s1_text_series = (
         s1_df.select(pl.coalesce(s1_exprs).fill_null("").str.strip_chars().alias("text"))
         .get_column("text")
@@ -138,18 +133,8 @@ def block_channel_tfidf_ngram(
     )
 
     try:
-        if _HAS_CUML:
-            import cudf
-            pool_series = cudf.Series(pool_text_series)
-            pool_series.index = cudf.RangeIndex(0, len(pool_series))
-            M_pool = vectorizer.fit_transform(pool_series)
-
-            s1_series = cudf.Series(s1_text_series)
-            s1_series.index = cudf.RangeIndex(0, len(s1_series))
-            M_s1 = vectorizer.transform(s1_series)
-        else:
-            M_pool = vectorizer.fit_transform(pool_text_series)
-            M_s1 = vectorizer.transform(s1_text_series)
+        M_pool = vectorizer.fit_transform(pool_text_series)
+        M_s1 = vectorizer.transform(s1_text_series)
     except Exception as e:
         logger.warning(f"TF-IDF failed: {e}")
         return empty_res
