@@ -28,6 +28,11 @@ from typing import Dict, List, Optional, Tuple
 
 import polars as pl
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = lambda x, **kwargs: x
+
 # Ensure repository root is in sys.path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -323,7 +328,7 @@ def generate_candidates_for_split(
     total_s1_processed = 0
 
     # 4. Iterate strictly by country partition
-    for idx, country in enumerate(countries, start=1):
+    for idx, country in enumerate(tqdm(countries, desc=f"Blocking {split.upper()} by Country"), start=1):
         c_start = time.time()
         s1_c = s1_df.filter(pl.col("country") == country)
         pool_c = pool_df.filter(pl.col("country") == country)
@@ -331,7 +336,7 @@ def generate_candidates_for_split(
         total_s1_processed += s1_c.height
 
         if pool_c.height == 0:
-            logger.warning(
+            logger.debug(
                 "[%d/%d] Country '%s': 0 candidate records in pool for %d S1 entities. Skipping.",
                 idx,
                 len(countries),
@@ -340,7 +345,7 @@ def generate_candidates_for_split(
             )
             continue
 
-        logger.info(
+        logger.debug(
             "[%d/%d] Blocking country '%s' | S1: %d | Pool: %d...",
             idx,
             len(countries),
@@ -361,7 +366,7 @@ def generate_candidates_for_split(
         s1_with_cands = pairs_c.select("source1_entity_id_int").unique().height
         coverage_pct = (s1_with_cands / s1_c.height * 100.0) if s1_c.height > 0 else 0.0
 
-        logger.info(
+        logger.debug(
             "  -> Country '%s' finished in %.2fs: %d candidate pairs | Coverage: %d/%d (%.2f%%)",
             country,
             c_elapsed,
