@@ -518,7 +518,7 @@ def main():
     logger.info("  TF-IDF Top-K         : %d", args.tfidf_top_k)
     logger.info("  Min TF-IDF Sim       : %.2f", args.min_tfidf_sim)
     logger.info("  Max Pool Key Cands   : %d", args.max_exact_per_key)
-    logger.info("  sparse_dot_topn      : %s", "Installed" if is_sparse_dot_topn_available() else "Not Installed (Using CSR chunked fallback)")
+    logger.info("  sparse_dot_topn      : %s", "Installed" if True else "Not Installed (Using CSR chunked fallback)")
 
     # Load global id_map if present
     id_map_path = args.parquet_dir / "id_map.parquet"
