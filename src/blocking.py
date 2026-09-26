@@ -5,12 +5,12 @@ Multi-Channel Candidate Blocking Engine for Amazon ML Challenge 2026.
 Channels:
   1. Exact matching on `name_token_sorted_key` (word-order invariant token match).
   2. Exact matching on `name_no_legal` (clean name stripped of legal suffixes).
-  3. TF-IDF character 3-4 n-grams cosine similarity top-20 on `name_no_legal`
-     (using sparse_dot_topn when available, with an optimized chunked CSR
-     multiplication fallback for memory efficiency).
+  3. TF-IDF character 3-4 n-grams cosine similarity top-20 on `name_no_legal`:
+     - GPU Accelerated Path: cuML TfidfVectorizer + CuPy cuSPARSE SpGEMM & batched top-K.
+     - CPU Optimized Path: sparse_dot_topn when available, with chunked CSR fallback.
 
 All channels operate on country-partitioned datasets and return pairs of
-(source1_entity_id_int, candidate_entity_id_int).
+(source1_entity_id_int, candidate_entity_id_int) as uint32.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -35,7 +35,34 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
-# sparse_dot_topn dynamic detection and configuration
+# GPU (cuML + CuPy) dynamic detection and configuration
+# ---------------------------------------------------------------------------
+_GPU_AVAILABLE: bool = False
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cp_sparse
+    from cuml.feature_extraction.text import TfidfVectorizer as cuTfidfVectorizer
+
+    # Verify that a CUDA device is present and accessible
+    if cp.cuda.is_available() and cp.cuda.runtime.getDeviceCount() > 0:
+        _GPU_AVAILABLE = True
+except (ImportError, Exception):
+    _GPU_AVAILABLE = False
+
+try:
+    import cudf
+    _CUDF_AVAILABLE = True
+except (ImportError, Exception):
+    _CUDF_AVAILABLE = False
+
+
+def is_gpu_blocking_available() -> bool:
+    """Returns True if cuML and CuPy with an active CUDA device are available."""
+    return _GPU_AVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# sparse_dot_topn dynamic detection and configuration (CPU path)
 # ---------------------------------------------------------------------------
 _SPARSE_DOT_TOPN_MODE: Optional[str] = None
 
@@ -56,7 +83,239 @@ def is_sparse_dot_topn_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Core Sparse Dot Product Top-K Operations
+# GPU Sparse Dot Product Top-K Operations (CuPy)
+# ---------------------------------------------------------------------------
+def gpu_sparse_dot_topk(
+    M_s1,
+    M_pool_T,
+    top_k: int = 20,
+    min_similarity: float = 0.20,
+    batch_size: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Computes top-K candidate matches per S1 query row using GPU cuSPARSE and CuPy.
+
+    Iterates through batches of M_s1, computes the sparse dot product against M_pool_T,
+    prunes elements below min_similarity, and performs GPU-accelerated argpartition/argsort
+    to extract the top-K column indices per row, returning host numpy arrays.
+
+    Parameters:
+      M_s1: CuPy sparse CSR matrix of S1 query vectors (shape: N x D).
+      M_pool_T: CuPy sparse CSR matrix of transposed candidate pool vectors (shape: D x M).
+      top_k: Maximum candidate indices to keep per S1 query row.
+      min_similarity: Minimum cosine similarity threshold.
+      batch_size: Number of S1 queries to process concurrently on GPU.
+                  Dynamically scaled to bound dense memory allocation to ~1 GB VRAM.
+
+    Returns:
+      Tuple of (matched_s1_local_indices, matched_pool_local_indices) as numpy int64 arrays.
+    """
+    n_s1 = M_s1.shape[0]
+    n_candidates = M_pool_T.shape[1]
+
+    if n_s1 == 0 or n_candidates == 0 or top_k <= 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
+    # Calculate optimal GPU batch size to bound dense memory to ~1 GB (250 million float32 elements)
+    max_dense_elements = 250_000_000
+    safe_gpu_batch = max(20, min(2000, max_dense_elements // max(1, n_candidates)))
+
+    if batch_size is None or batch_size > safe_gpu_batch:
+        effective_batch_size = safe_gpu_batch
+    else:
+        effective_batch_size = max(1, batch_size)
+
+    actual_k = min(top_k, n_candidates)
+    matched_s1_list: List[np.ndarray] = []
+    matched_pool_list: List[np.ndarray] = []
+
+    for i in range(0, n_s1, effective_batch_size):
+        end_idx = min(i + effective_batch_size, n_s1)
+        chunk = M_s1[i:end_idx]
+
+        # 1. Sparse dot product on GPU: (B, D) x (D, M) -> (B, M)
+        sim_chunk = chunk.dot(M_pool_T)
+
+        # 2. Convert to dense array on GPU
+        if hasattr(sim_chunk, "toarray"):
+            sim_dense = sim_chunk.toarray()
+        else:
+            sim_dense = cp.asarray(sim_chunk.todense())
+
+        B = sim_dense.shape[0]
+
+        # 3. Filter entries below similarity threshold
+        if min_similarity > 0.0:
+            sim_dense[sim_dense < min_similarity] = 0.0
+
+        # 4. Top-K extraction using CuPy argpartition and argsort
+        if n_candidates > actual_k:
+            topk_idx = cp.argpartition(-sim_dense, actual_k - 1, axis=1)[:, :actual_k]
+            topk_vals = sim_dense[cp.arange(B)[:, None], topk_idx]
+
+            # Sort the top-k in descending order
+            order = cp.argsort(-topk_vals, axis=1)
+            sorted_cols = topk_idx[cp.arange(B)[:, None], order]
+            sorted_vals = topk_vals[cp.arange(B)[:, None], order]
+        else:
+            # Full sort if total candidates <= actual_k
+            sorted_cols = cp.argsort(-sim_dense, axis=1)
+            sorted_vals = sim_dense[cp.arange(B)[:, None], sorted_cols]
+
+        # 5. Extract only valid pairs >= min_similarity (and > 0.0)
+        if min_similarity > 0.0:
+            valid_mask = sorted_vals >= min_similarity
+        else:
+            valid_mask = sorted_vals > 0.0
+
+        if not bool(cp.any(valid_mask)):
+            continue
+
+        # Row indices for the batch: shape (B, 1) broadcasted to (B, actual_k)
+        batch_rows = cp.broadcast_to(
+            cp.arange(i, end_idx, dtype=cp.int64)[:, None],
+            sorted_cols.shape,
+        )
+
+        matched_rows_cp = batch_rows[valid_mask]
+        matched_cols_cp = sorted_cols[valid_mask]
+
+        matched_s1_list.append(cp.asnumpy(matched_rows_cp))
+        matched_pool_list.append(cp.asnumpy(matched_cols_cp))
+
+    # Free memory pool blocks allocated during batch processing
+    cp.get_default_memory_pool().free_all_blocks()
+
+    if matched_s1_list:
+        return np.concatenate(matched_s1_list), np.concatenate(matched_pool_list)
+    return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
+
+def _block_channel_tfidf_ngram_gpu(
+    s1_df: pl.DataFrame,
+    pool_df: pl.DataFrame,
+    s1_text_series: List[str],
+    pool_text_series: List[str],
+    s1_id_col: str,
+    pool_id_col: str,
+    top_k: int,
+    min_similarity: float,
+    ngram_range: Tuple[int, int],
+    batch_size: int,
+) -> pl.DataFrame:
+    """
+    GPU-accelerated Channel 3 TF-IDF n-gram candidate retrieval using cuML and CuPy.
+    """
+    empty_res = pl.DataFrame(
+        schema={s1_id_col: pl.UInt32, pool_id_col: pl.UInt32}
+    )
+
+    min_df = 2 if len(pool_text_series) > 100 else 1
+
+    # Instantiate cuML TfidfVectorizer with robust argument fallback
+    vec_kwargs = {
+        "analyzer": "char",
+        "ngram_range": ngram_range,
+        "norm": "l2",
+        "sublinear_tf": True,
+        "min_df": min_df,
+    }
+
+    vectorizer = None
+    for attempt_args in [
+        vec_kwargs,
+        {k: v for k, v in vec_kwargs.items() if k != "min_df"},
+        {"analyzer": "char", "ngram_range": ngram_range, "norm": "l2", "sublinear_tf": True},
+        {"analyzer": "char", "ngram_range": ngram_range, "norm": "l2"},
+        {"analyzer": "char", "ngram_range": ngram_range},
+    ]:
+        try:
+            vectorizer = cuTfidfVectorizer(**attempt_args)
+            break
+        except TypeError:
+            continue
+
+    if vectorizer is None:
+        raise RuntimeError("Failed to initialize cuML TfidfVectorizer.")
+
+    # Prepare inputs (prefer cudf.Series for zero-copy GPU string parsing)
+    if _CUDF_AVAILABLE:
+        try:
+            import cudf
+            pool_input = cudf.Series(pool_text_series)
+            s1_input = cudf.Series(s1_text_series)
+        except Exception:
+            pool_input = pool_text_series
+            s1_input = s1_text_series
+    else:
+        pool_input = pool_text_series
+        s1_input = s1_text_series
+
+    try:
+        M_pool = vectorizer.fit_transform(pool_input)
+        M_s1 = vectorizer.transform(s1_input)
+    except ValueError:
+        # Handles empty vocabulary
+        return empty_res
+
+    # Convert to CuPy CSR format if needed
+    if not isinstance(M_pool, cp_sparse.csr_matrix):
+        if hasattr(M_pool, "tocsr"):
+            M_pool = M_pool.tocsr()
+        else:
+            M_pool = cp_sparse.csr_matrix(M_pool)
+
+    if not isinstance(M_s1, cp_sparse.csr_matrix):
+        if hasattr(M_s1, "tocsr"):
+            M_s1 = M_s1.tocsr()
+        else:
+            M_s1 = cp_sparse.csr_matrix(M_s1)
+
+    # Transpose candidate matrix to D x M and ensure CSR for fast dot product
+    M_pool_T = M_pool.T
+    if not isinstance(M_pool_T, cp_sparse.csr_matrix):
+        if hasattr(M_pool_T, "tocsr"):
+            M_pool_T = M_pool_T.tocsr()
+        else:
+            M_pool_T = cp_sparse.csr_matrix(M_pool_T)
+
+    # Free M_pool and input series to maximize available VRAM for dot-product
+    del M_pool
+    del pool_input
+    del s1_input
+    cp.get_default_memory_pool().free_all_blocks()
+
+    # Query GPU top-K
+    s1_local_idx, pool_local_idx = gpu_sparse_dot_topk(
+        M_s1=M_s1,
+        M_pool_T=M_pool_T,
+        top_k=top_k,
+        min_similarity=min_similarity,
+        batch_size=batch_size,
+    )
+
+    del M_s1
+    del M_pool_T
+    cp.get_default_memory_pool().free_all_blocks()
+
+    if len(s1_local_idx) == 0:
+        return empty_res
+
+    # Map local matrix indices back to global uint32 integer IDs
+    s1_ids_arr = s1_df.get_column(s1_id_col).to_numpy()
+    pool_ids_arr = pool_df.get_column(pool_id_col).to_numpy()
+
+    matched_s1 = s1_ids_arr[s1_local_idx]
+    matched_pool = pool_ids_arr[pool_local_idx]
+
+    return pl.DataFrame({
+        s1_id_col: pl.Series(matched_s1, dtype=pl.UInt32),
+        pool_id_col: pl.Series(matched_pool, dtype=pl.UInt32),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Core CPU Sparse Dot Product Top-K Operations
 # ---------------------------------------------------------------------------
 def _topk_from_csr(
     csr_mat: sparse.csr_matrix,
@@ -118,7 +377,7 @@ def sparse_dot_topk(
     n_jobs: int = -1,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Computes top-K values from sparse matrix multiplication A x B_T.
+    Computes top-K values from sparse matrix multiplication A x B_T on CPU.
 
     If sparse_dot_topn is installed, it leverages native C++ sp_matmul_topn /
     awesome_cossim_topn. Otherwise, falls back to chunked CSR matrix multiplication
@@ -236,10 +495,12 @@ def block_channel_exact_key(
     Performs exact equality blocking on a specified key column (e.g. name_token_sorted_key or name_no_legal).
     Caps candidate pool entries per key to prevent combinatorial explosion on high-frequency noise.
     """
+    empty_res = pl.DataFrame(
+        schema={s1_id_col: pl.UInt32, pool_id_col: pl.UInt32}
+    )
+
     if key_col not in s1_df.columns or key_col not in pool_df.columns:
-        return pl.DataFrame(
-            schema={s1_id_col: pl.UInt32, pool_id_col: pl.UInt32}
-        )
+        return empty_res
 
     # Filter non-null, non-empty keys
     s1_sub = s1_df.select([s1_id_col, key_col]).filter(
@@ -250,9 +511,7 @@ def block_channel_exact_key(
     )
 
     if s1_sub.height == 0 or pool_sub.height == 0:
-        return pl.DataFrame(
-            schema={s1_id_col: pl.UInt32, pool_id_col: pl.UInt32}
-        )
+        return empty_res
 
     # Cap high-frequency keys in pool to max_candidates_per_key
     if max_candidates_per_key > 0:
@@ -265,10 +524,13 @@ def block_channel_exact_key(
             .drop("_rank_in_key")
         )
 
-    # Fast inner join on exact key
+    # Fast inner join on exact key, ensuring uint32 integer ID output
     joined = (
         s1_sub.join(pool_sub, on=key_col, how="inner")
-        .select([s1_id_col, pool_id_col])
+        .select([
+            pl.col(s1_id_col).cast(pl.UInt32),
+            pl.col(pool_id_col).cast(pl.UInt32),
+        ])
     )
     return joined
 
@@ -284,12 +546,30 @@ def block_channel_tfidf_ngram(
     ngram_range: Tuple[int, int] = (3, 4),
     batch_size: int = 25000,
     n_jobs: int = -1,
+    use_gpu: Optional[bool] = None,
 ) -> pl.DataFrame:
     """
     Channel 3: Character N-gram TF-IDF cosine similarity top-K candidate retrieval.
 
-    Fits TF-IDF vectorizer (char 3-4 n-grams) on pool texts, transforms S1 texts,
-    and retrieves top-K candidate pool entities with similarity >= min_similarity.
+    If cuML and CuPy are available (and not disabled via use_gpu=False), vectors are
+    computed on GPU using cuML's TfidfVectorizer and queried via CuPy sparse matrix
+    multiplication. Otherwise, runs the optimized CPU path.
+
+    Parameters:
+      s1_df: Reference S1 entity DataFrame.
+      pool_df: Candidate pool DataFrame (S2/S3).
+      text_col: Column name containing the text representation.
+      s1_id_col: Column name for S1 integer ID.
+      pool_id_col: Column name for candidate pool integer ID.
+      top_k: Maximum candidate pool matches to retrieve per S1 entity.
+      min_similarity: Minimum cosine similarity threshold.
+      ngram_range: Tuple of (min_n, max_n) character n-gram lengths.
+      batch_size: Number of queries per processing chunk.
+      n_jobs: Number of CPU worker threads for CPU fallback.
+      use_gpu: Optional boolean flag to force GPU (True) or CPU (False). Defaults to auto-detect.
+
+    Returns:
+      Polars DataFrame with schema [s1_id_col: UInt32, pool_id_col: UInt32].
     """
     empty_res = pl.DataFrame(schema={s1_id_col: pl.UInt32, pool_id_col: pl.UInt32})
 
@@ -321,6 +601,29 @@ def block_channel_tfidf_ngram(
     if not any(s1_text_series) or not any(pool_text_series):
         return empty_res
 
+    # 1. GPU RAPIDS accelerated path if available
+    gpu_active = _GPU_AVAILABLE if use_gpu is None else (use_gpu and _GPU_AVAILABLE)
+    if gpu_active:
+        try:
+            return _block_channel_tfidf_ngram_gpu(
+                s1_df=s1_df,
+                pool_df=pool_df,
+                s1_text_series=s1_text_series,
+                pool_text_series=pool_text_series,
+                s1_id_col=s1_id_col,
+                pool_id_col=pool_id_col,
+                top_k=top_k,
+                min_similarity=min_similarity,
+                ngram_range=ngram_range,
+                batch_size=batch_size,
+            )
+        except Exception as e:
+            logger.warning(
+                "GPU TF-IDF blocking failed with error: %s; falling back to CPU implementation.",
+                e,
+            )
+
+    # 2. CPU fallback path
     min_df = 2 if len(pool_text_series) > 100 else 1
     vectorizer = TfidfVectorizer(
         analyzer="char",
@@ -339,7 +642,7 @@ def block_channel_tfidf_ngram(
 
     M_pool_T = M_pool.T.tocsr()
 
-    # Query sparse top-k
+    # Query sparse top-k on CPU
     s1_local_idx, pool_local_idx = sparse_dot_topk(
         A=M_s1,
         B_T=M_pool_T,
@@ -376,6 +679,7 @@ class MultiChannelBlocker:
       1. Exact matching on `name_token_sorted_key`
       2. Exact matching on `name_no_legal`
       3. TF-IDF char 3-4 n-gram cosine similarity top-20 on `name_no_legal`
+         (GPU RAPIDS cuML/CuPy accelerated with CPU fallback)
 
     Outputs deduplicated pairs of (s1_id_int, pool_id_int) capped to max_candidates_per_s1.
     """
@@ -389,6 +693,7 @@ class MultiChannelBlocker:
         max_candidates_per_s1: int = 20,
         batch_size: int = 25000,
         n_jobs: int = -1,
+        use_gpu: Optional[bool] = None,
     ):
         self.ngram_range = ngram_range
         self.tfidf_top_k = tfidf_top_k
@@ -397,6 +702,7 @@ class MultiChannelBlocker:
         self.max_candidates_per_s1 = max_candidates_per_s1
         self.batch_size = batch_size
         self.n_jobs = n_jobs
+        self.use_gpu = use_gpu
 
     def block_country(
         self,
@@ -409,8 +715,10 @@ class MultiChannelBlocker:
         Executes all 3 blocking channels on a country subset and returns
         deduplicated candidate pairs capped to max_candidates_per_s1 per S1 entity.
         """
+        empty_res = pl.DataFrame(schema={s1_id_col: pl.UInt32, pool_id_col: pl.UInt32})
+
         if s1_df.height == 0 or pool_df.height == 0:
-            return pl.DataFrame(schema={s1_id_col: pl.UInt32, pool_id_col: pl.UInt32})
+            return empty_res
 
         # Channel 1: Exact match on name_token_sorted_key
         pairs_c1 = block_channel_exact_key(
@@ -432,7 +740,7 @@ class MultiChannelBlocker:
             max_candidates_per_key=self.max_exact_per_key,
         )
 
-        # Channel 3: TF-IDF char n-grams cosine similarity top-20
+        # Channel 3: TF-IDF char n-grams cosine similarity top-20 (GPU or CPU)
         pairs_c3 = block_channel_tfidf_ngram(
             s1_df=s1_df,
             pool_df=pool_df,
@@ -444,12 +752,13 @@ class MultiChannelBlocker:
             ngram_range=self.ngram_range,
             batch_size=self.batch_size,
             n_jobs=self.n_jobs,
+            use_gpu=self.use_gpu,
         )
 
         # Union pairs in priority order: Channel 1 -> Channel 2 -> Channel 3
         combined = pl.concat([pairs_c1, pairs_c2, pairs_c3])
         if combined.height == 0:
-            return pl.DataFrame(schema={s1_id_col: pl.UInt32, pool_id_col: pl.UInt32})
+            return empty_res
 
         # Deduplicate preserving first occurrence (exact matches have priority over fuzzy)
         deduped = combined.unique(
@@ -503,10 +812,11 @@ def run_multi_channel_blocking(
     max_exact_per_key: int = 200,
     batch_size: int = 25000,
     n_jobs: int = -1,
+    use_gpu: Optional[bool] = None,
 ) -> pl.DataFrame:
     """
     Functional interface to run multi-channel candidate blocking on a country partition.
-    Returns a Polars DataFrame with columns [s1_id_col, pool_id_col].
+    Returns a Polars DataFrame with columns [s1_id_col, pool_id_col] as UInt32.
     """
     blocker = MultiChannelBlocker(
         tfidf_top_k=tfidf_top_k,
@@ -515,6 +825,7 @@ def run_multi_channel_blocking(
         max_candidates_per_s1=max_candidates,
         batch_size=batch_size,
         n_jobs=n_jobs,
+        use_gpu=use_gpu,
     )
     return blocker.block_country(
         s1_df=s1_df,
