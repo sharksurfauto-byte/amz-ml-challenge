@@ -353,9 +353,18 @@ def block_channel_tfidf_ngram(
     if not any(s1_text_series) or not any(pool_text_series):
         return empty_res
 
-    min_df = 2 if len(pool_text_series) > 100 else 1
+    # Adaptive min_df to strictly prune vocabulary explosion on large datasets
+    if len(pool_text_series) > 1_000_000:
+        min_df = 10
+    elif len(pool_text_series) > 100_000:
+        min_df = 5
+    elif len(pool_text_series) > 100:
+        min_df = 2
+    else:
+        min_df = 1
+
     vectorizer = TfidfVectorizer(
-        analyzer="char",
+        analyzer="char_wb", # word boundary char n-grams dramatically cuts meaningless cross-word typos
         ngram_range=ngram_range,
         min_df=min_df,
         norm="l2",
