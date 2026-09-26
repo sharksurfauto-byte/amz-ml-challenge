@@ -40,8 +40,16 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
-# sparse_dot_topn dynamic detection and configuration
+# GPU (CuPy) & sparse_dot_topn dynamic detection
 # ---------------------------------------------------------------------------
+_HAS_CUPY = False
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cpx
+    _HAS_CUPY = True
+except ImportError:
+    _HAS_CUPY = False
+
 _SPARSE_DOT_TOPN_MODE: Optional[str] = None
 
 try:
@@ -148,7 +156,46 @@ def sparse_dot_topk(
 
     effective_threads = max(1, os.cpu_count() or 1) if n_jobs <= 0 else n_jobs
 
-    # 1. Native multithreaded C++ sparse_dot_topn path
+    # 1. CuPy GPU Path
+    if _HAS_CUPY:
+        try:
+            logger.info("    [GPU] Accelerating sparse matrix dot product with CuPy...")
+            # We use smaller batches on the GPU to strictly prevent VRAM OOM on dense n-grams
+            gpu_batch = min(batch_size, 2500)
+            B_T_gpu = cpx.csr_matrix(B_T)
+            
+            all_r: List[np.ndarray] = []
+            all_c: List[np.ndarray] = []
+            
+            for start_idx in range(0, n_queries, gpu_batch):
+                end_idx = min(start_idx + gpu_batch, n_queries)
+                sub_A_gpu = cpx.csr_matrix(A[start_idx:end_idx])
+                
+                # O(N*M) heavy dot-product executed on GPU Cuda cores
+                sim_mat_gpu = sub_A_gpu.dot(B_T_gpu)
+                
+                # Fetch sparse result matrix back to host CPU for Top-K extraction
+                sim_mat_cpu = sim_mat_gpu.get()
+                r, c = _topk_from_csr(sim_mat_cpu, top_k=top_k, min_similarity=min_similarity)
+                
+                if len(r) > 0:
+                    all_r.append(r + start_idx)
+                    all_c.append(c)
+                
+                del sub_A_gpu, sim_mat_gpu, sim_mat_cpu
+                cp.get_default_memory_pool().free_all_blocks()
+                
+            del B_T_gpu
+            cp.get_default_memory_pool().free_all_blocks()
+            
+            if all_r:
+                return np.concatenate(all_r), np.concatenate(all_c)
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+            
+        except Exception as e:
+            logger.warning("CuPy GPU acceleration failed: %s. Falling back to CPU...", e)
+
+    # 2. Native multithreaded C++ sparse_dot_topn path
     if _SPARSE_DOT_TOPN_MODE == "sp_matmul_topn":
         try:
             import sparse_dot_topn
