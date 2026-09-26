@@ -13,12 +13,11 @@ import numpy as np
 import polars as pl
 
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
 try:
-    from cuml.decomposition import TruncatedSVD
     from cuml.neighbors import NearestNeighbors
     _HAS_CUML = True
 except ImportError:
-    from sklearn.decomposition import TruncatedSVD
     from sklearn.neighbors import NearestNeighbors
     _HAS_CUML = False
 
