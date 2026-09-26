@@ -170,12 +170,12 @@ def load_dataset_split(
 
     # Select common schema columns for searchable pool
     pool_cols = ["candidate_entity_id_int", "country", "name_token_sorted_key", "name_no_legal"]
-    for opt_col in ["business_name", "name_clean"]:
+    for opt_col in ["business_name", "name_clean", "address_street_number", "domain_root", "address_clean"]:
         if opt_col in df_s2.columns and opt_col in df_s3.columns:
             pool_cols.append(opt_col)
 
     s1_cols = ["source1_entity_id_int", "country", "name_token_sorted_key", "name_no_legal"]
-    for opt_col in ["business_name", "name_clean"]:
+    for opt_col in ["business_name", "name_clean", "address_street_number", "domain_root", "address_clean"]:
         if opt_col in df_s1.columns:
             s1_cols.append(opt_col)
 

@@ -138,7 +138,11 @@ def block_channel_tfidf_ngram(
         logger.warning(f"TF-IDF failed: {e}")
         return empty_res
 
-    svd = TruncatedSVD(n_components=128)
+    if M_pool.shape[1] < 2:
+        return empty_res
+
+    n_comp = min(128, M_pool.shape[1] - 1)
+    svd = TruncatedSVD(n_components=n_comp)
     pool_dense = svd.fit_transform(M_pool)
     s1_dense = svd.transform(M_s1)
 
@@ -251,7 +255,25 @@ class MultiChannelBlocker:
             n_jobs=self.n_jobs,
         )
 
-        combined = pl.concat([pairs_c1, pairs_c2, pairs_c3])
+        pairs_c4 = block_channel_exact_key(
+            s1_df=s1_df,
+            pool_df=pool_df,
+            key_col="address_street_number",
+            s1_id_col=s1_id_col,
+            pool_id_col=pool_id_col,
+            max_candidates_per_key=self.max_exact_per_key,
+        )
+
+        pairs_c5 = block_channel_exact_key(
+            s1_df=s1_df,
+            pool_df=pool_df,
+            key_col="domain_root",
+            s1_id_col=s1_id_col,
+            pool_id_col=pool_id_col,
+            max_candidates_per_key=self.max_exact_per_key,
+        )
+
+        combined = pl.concat([pairs_c1, pairs_c2, pairs_c3, pairs_c4, pairs_c5])
         if combined.height == 0:
             return empty_res
 
