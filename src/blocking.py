@@ -55,10 +55,12 @@ try:
 except (ImportError, Exception):
     _CUDF_AVAILABLE = False
 
+HAS_GPU_RAPIDS_CUML: bool = _GPU_AVAILABLE and _CUDF_AVAILABLE
+
 
 def is_gpu_blocking_available() -> bool:
     """Returns True if cuML and CuPy with an active CUDA device are available."""
-    return _GPU_AVAILABLE
+    return HAS_GPU_RAPIDS_CUML
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +196,8 @@ def gpu_sparse_dot_topk(
 def _block_channel_tfidf_ngram_gpu(
     s1_df: pl.DataFrame,
     pool_df: pl.DataFrame,
-    s1_text_series: List[str],
-    pool_text_series: List[str],
+    s1_exprs: List[pl.Expr],
+    pool_exprs: List[pl.Expr],
     s1_id_col: str,
     pool_id_col: str,
     top_k: int,
@@ -204,13 +206,37 @@ def _block_channel_tfidf_ngram_gpu(
     batch_size: int,
 ) -> pl.DataFrame:
     """
-    GPU-accelerated Channel 3 TF-IDF n-gram candidate retrieval using cuML and CuPy.
+    GPU-accelerated Channel 3 TF-IDF n-gram candidate retrieval using cuML, cuDF, and CuPy.
     """
+    import cudf
+
     empty_res = pl.DataFrame(
         schema={s1_id_col: pl.UInt32, pool_id_col: pl.UInt32}
     )
 
-    min_df = 2 if len(pool_text_series) > 100 else 1
+    # For GPU path: directly use Arrow to bypass Python lists
+    pool_sel = pool_df.select(pl.coalesce(pool_exprs).fill_null("").str.strip_chars())
+    try:
+        pool_arrow = pool_sel.get_column(0).to_arrow()
+    except (TypeError, Exception):
+        pool_arrow = pool_sel.to_series(0).to_arrow()
+    pool_cudf = cudf.Series(pool_arrow)
+    del pool_arrow
+
+    s1_sel = s1_df.select(pl.coalesce(s1_exprs).fill_null("").str.strip_chars())
+    try:
+        s1_arrow = s1_sel.get_column(0).to_arrow()
+    except (TypeError, Exception):
+        s1_arrow = s1_sel.to_series(0).to_arrow()
+    s1_cudf = cudf.Series(s1_arrow)
+    del s1_arrow
+
+    if len(pool_cudf) == 0 or len(s1_cudf) == 0:
+        del pool_cudf
+        del s1_cudf
+        return empty_res
+
+    min_df = 2 if len(pool_cudf) > 100 else 1
 
     # Instantiate cuML TfidfVectorizer with robust argument fallback
     vec_kwargs = {
@@ -236,27 +262,25 @@ def _block_channel_tfidf_ngram_gpu(
             continue
 
     if vectorizer is None:
+        del pool_cudf
+        del s1_cudf
         raise RuntimeError("Failed to initialize cuML TfidfVectorizer.")
 
-    # Prepare inputs (prefer cudf.Series for zero-copy GPU string parsing)
-    if _CUDF_AVAILABLE:
-        try:
-            import cudf
-            pool_input = cudf.Series(pool_text_series)
-            s1_input = cudf.Series(s1_text_series)
-        except Exception:
-            pool_input = pool_text_series
-            s1_input = s1_text_series
-    else:
-        pool_input = pool_text_series
-        s1_input = s1_text_series
-
+    # Now fit transform the cudf Series
     try:
-        M_pool = vectorizer.fit_transform(pool_input)
-        M_s1 = vectorizer.transform(s1_input)
+        M_pool = vectorizer.fit_transform(pool_cudf)
+        M_s1 = vectorizer.transform(s1_cudf)
     except ValueError:
         # Handles empty vocabulary
+        del pool_cudf
+        del s1_cudf
         return empty_res
+
+    # Free cudf Series and vectorizer to clean VRAM before heavy dot product loop
+    del pool_cudf
+    del s1_cudf
+    del vectorizer
+    cp.get_default_memory_pool().free_all_blocks()
 
     # Convert to CuPy CSR format if needed
     if not isinstance(M_pool, cp_sparse.csr_matrix):
@@ -279,10 +303,8 @@ def _block_channel_tfidf_ngram_gpu(
         else:
             M_pool_T = cp_sparse.csr_matrix(M_pool_T)
 
-    # Free M_pool and input series to maximize available VRAM for dot-product
+    # Free M_pool to maximize available VRAM for dot-product
     del M_pool
-    del pool_input
-    del s1_input
     cp.get_default_memory_pool().free_all_blocks()
 
     # Query GPU top-K
@@ -581,35 +603,21 @@ def block_channel_tfidf_ngram(
     s1_exprs = [pl.col(c) for c in [text_col, "name_clean", "business_name"] if c in s1_cols]
     if not s1_exprs:
         return empty_res
-    s1_text_series = (
-        s1_df.select(pl.coalesce(s1_exprs).fill_null("").str.strip_chars().alias("text"))
-        .get_column("text")
-        .to_list()
-    )
 
     pool_cols = pool_df.columns
     pool_exprs = [pl.col(c) for c in [text_col, "name_clean", "business_name"] if c in pool_cols]
     if not pool_exprs:
         return empty_res
-    pool_text_series = (
-        pool_df.select(pl.coalesce(pool_exprs).fill_null("").str.strip_chars().alias("text"))
-        .get_column("text")
-        .to_list()
-    )
-
-    # Check if there are non-empty texts to vectorize
-    if not any(s1_text_series) or not any(pool_text_series):
-        return empty_res
 
     # 1. GPU RAPIDS accelerated path if available
-    gpu_active = _GPU_AVAILABLE if use_gpu is None else (use_gpu and _GPU_AVAILABLE)
+    gpu_active = HAS_GPU_RAPIDS_CUML if use_gpu is None else (use_gpu and HAS_GPU_RAPIDS_CUML)
     if gpu_active:
         try:
             return _block_channel_tfidf_ngram_gpu(
                 s1_df=s1_df,
                 pool_df=pool_df,
-                s1_text_series=s1_text_series,
-                pool_text_series=pool_text_series,
+                s1_exprs=s1_exprs,
+                pool_exprs=pool_exprs,
                 s1_id_col=s1_id_col,
                 pool_id_col=pool_id_col,
                 top_k=top_k,
@@ -623,7 +631,21 @@ def block_channel_tfidf_ngram(
                 e,
             )
 
-    # 2. CPU fallback path
+    # 2. CPU fallback path: only extract Python lists when running on CPU
+    s1_text_series = (
+        s1_df.select(pl.coalesce(s1_exprs).fill_null("").str.strip_chars().alias("text"))
+        .get_column("text")
+        .to_list()
+    )
+    pool_text_series = (
+        pool_df.select(pl.coalesce(pool_exprs).fill_null("").str.strip_chars().alias("text"))
+        .get_column("text")
+        .to_list()
+    )
+
+    # Check if there are non-empty texts to vectorize
+    if not any(s1_text_series) or not any(pool_text_series):
+        return empty_res
     min_df = 2 if len(pool_text_series) > 100 else 1
     vectorizer = TfidfVectorizer(
         analyzer="char",
