@@ -132,6 +132,9 @@ def block_channel_tfidf_ngram(
         analyzer="char_wb",
         ngram_range=ngram_range,
         min_df=min_df,
+        max_df=0.3,
+        max_features=100000,
+        dtype=np.float32,
     )
 
     try:
