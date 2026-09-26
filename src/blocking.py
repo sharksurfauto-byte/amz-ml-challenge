@@ -161,7 +161,9 @@ def sparse_dot_topk(
         try:
             logger.info("    [GPU] Accelerating sparse matrix dot product with CuPy...")
             # We use smaller batches on the GPU to strictly prevent VRAM OOM on dense n-grams
-            gpu_batch = min(batch_size, 2500)
+            # Calculate batch size dynamically to bound VRAM. 54GB for 2500 means ~22MB per row.
+            # We want max ~2GB allocated, so batch size around 50-100.
+            gpu_batch = max(50, 1_000_000 // max(1, n_candidates))
             B_T_gpu = cpx.csr_matrix(B_T)
             
             all_r: List[np.ndarray] = []
