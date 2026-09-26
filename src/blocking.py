@@ -88,7 +88,7 @@ def _topk_from_csr(
     out_rows: List[np.ndarray] = []
     out_cols: List[np.ndarray] = []
 
-    for i in tqdm(range(n_rows), desc="CPU Sparse Dot Top-K", leave=False, miniters=10000):
+    for i in range(n_rows):
         start = indptr[i]
         end = indptr[i + 1]
         if start == end:
@@ -167,7 +167,7 @@ def sparse_dot_topk(
             all_r: List[np.ndarray] = []
             all_c: List[np.ndarray] = []
             
-            for start_idx in range(0, n_queries, gpu_batch):
+            for start_idx in tqdm(range(0, n_queries, gpu_batch), desc="GPU Sparse Batches", leave=False):
                 end_idx = min(start_idx + gpu_batch, n_queries)
                 sub_A_gpu = cpx.csr_matrix(A[start_idx:end_idx])
                 
