@@ -38,7 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.blocking_lsa import MultiChannelBlocker, is_sparse_dot_topn_available
+from src.blocking_lsa import MultiChannelBlocker
 from src.normalize import (
     address_keys,
     clean_text,
