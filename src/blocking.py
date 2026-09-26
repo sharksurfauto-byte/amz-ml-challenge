@@ -6,7 +6,7 @@ Channels:
   1. Exact matching on `name_token_sorted_key` (word-order invariant token match).
   2. Exact matching on `name_no_legal` (clean name stripped of legal suffixes).
   3. TF-IDF character 3-4 n-grams cosine similarity top-20 on `name_no_legal`:
-     - GPU Accelerated Path: cuML TfidfVectorizer + CuPy cuSPARSE SpGEMM & batched top-K.
+     - GPU Accelerated Path: cuML TfidfVectorizer + TruncatedSVD (LSA) + cuML NearestNeighbors (cosine).
      - CPU Optimized Path: sparse_dot_topn when available, with chunked CSR fallback.
 
 All channels operate on country-partitioned datasets and return pairs of
@@ -47,6 +47,8 @@ try:
     import cupy as cp
     import cupyx.scipy.sparse as cp_sparse
     from cuml.feature_extraction.text import TfidfVectorizer as cuTfidfVectorizer
+    from cuml.decomposition import TruncatedSVD as cuTruncatedSVD
+    from cuml.neighbors import NearestNeighbors as cuNearestNeighbors
 
     # Verify that a CUDA device is present and accessible
     if cp.cuda.is_available() and cp.cuda.runtime.getDeviceCount() > 0:
@@ -61,6 +63,12 @@ except (ImportError, Exception):
     _CUDF_AVAILABLE = False
 
 HAS_GPU_RAPIDS_CUML: bool = _GPU_AVAILABLE and _CUDF_AVAILABLE
+
+try:
+    import faiss
+    _FAISS_AVAILABLE = True
+except (ImportError, Exception):
+    _FAISS_AVAILABLE = False
 
 
 def is_gpu_blocking_available() -> bool:
@@ -90,8 +98,236 @@ def is_sparse_dot_topn_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# GPU Sparse Dot Product Top-K Operations (CuPy)
+# GPU Sparse Dot Product & LSA NearestNeighbors Top-K Operations (CuPy / cuML)
 # ---------------------------------------------------------------------------
+def gpu_knn_lsa_topk(
+    M_s1,
+    M_pool,
+    top_k: int = 20,
+    min_similarity: float = 0.20,
+    n_components: int = 128,
+    batch_size: int = 25000,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Computes top-K candidate matches per S1 query row using GPU Latent Semantic Analysis (LSA)
+    with cuML TruncatedSVD and cuML NearestNeighbors (cosine metric).
+
+    Steps:
+      1. Apply cuML TruncatedSVD(n_components=128) on M_pool and M_s1 if M_pool.shape[1] > 128.
+      2. Normalize the resulting dense matrices to unit L2 norm using CuPy.
+      3. Fit cuML NearestNeighbors(n_neighbors=top_k, metric='cosine') on M_pool_dense.
+      4. Query M_s1_dense in memory-safe batches to obtain indices and distances.
+      5. Filter by 1 - distances >= min_similarity.
+      6. Return row_idx, col_idx numpy arrays.
+
+    Parameters:
+      M_s1: CuPy sparse CSR matrix of S1 query vectors (shape: N x D).
+      M_pool: CuPy sparse CSR matrix of candidate pool vectors (shape: M x D).
+      top_k: Maximum candidate indices to retrieve per S1 query row.
+      min_similarity: Minimum cosine similarity threshold.
+      n_components: Target dimension for TruncatedSVD dimensionality reduction (default: 128).
+      batch_size: Batch size of S1 queries to evaluate per KNN inference step.
+
+    Returns:
+      Tuple of (matched_s1_local_indices, matched_pool_local_indices) as numpy int64 arrays.
+    """
+    n_s1 = M_s1.shape[0]
+    n_candidates = M_pool.shape[0]
+
+    if n_s1 == 0 or n_candidates == 0 or top_k <= 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
+    n_features = M_pool.shape[1]
+
+    # Step 1 & 2: Apply TruncatedSVD if n_features > n_components
+    if n_features > n_components and min(n_s1, n_candidates) > n_components:
+        logger.info(
+            "Applying cuML TruncatedSVD (n_components=%d) on %d sparse features (pool: %d, s1: %d)...",
+            n_components,
+            n_features,
+            n_candidates,
+            n_s1,
+        )
+        try:
+            from cuml.decomposition import TruncatedSVD as cuTruncatedSVD
+            try:
+                svd = cuTruncatedSVD(n_components=n_components, output_type="cupy")
+            except TypeError:
+                svd = cuTruncatedSVD(n_components=n_components)
+
+            M_pool_dense = svd.fit_transform(M_pool)
+            M_s1_dense = svd.transform(M_s1)
+        except Exception as e_svd:
+            logger.warning(
+                "cuML TruncatedSVD failed with %s; falling back to direct dense conversion.",
+                e_svd,
+            )
+            if hasattr(M_pool, "toarray"):
+                M_pool_dense = M_pool.toarray()
+            else:
+                M_pool_dense = cp.asarray(M_pool.todense())
+            if hasattr(M_s1, "toarray"):
+                M_s1_dense = M_s1.toarray()
+            else:
+                M_s1_dense = cp.asarray(M_s1.todense())
+    else:
+        # Small feature space or sample size, convert directly to dense
+        if hasattr(M_pool, "toarray"):
+            M_pool_dense = M_pool.toarray()
+        else:
+            M_pool_dense = cp.asarray(M_pool.todense())
+        if hasattr(M_s1, "toarray"):
+            M_s1_dense = M_s1.toarray()
+        else:
+            M_s1_dense = cp.asarray(M_s1.todense())
+
+    # Ensure CuPy ndarray with float32 precision
+    if hasattr(M_pool_dense, "to_cupy"):
+        M_pool_dense = M_pool_dense.to_cupy()
+    elif hasattr(M_pool_dense, "values"):
+        M_pool_dense = cp.asarray(M_pool_dense.values)
+    elif not isinstance(M_pool_dense, cp.ndarray):
+        M_pool_dense = cp.asarray(M_pool_dense)
+
+    if hasattr(M_s1_dense, "to_cupy"):
+        M_s1_dense = M_s1_dense.to_cupy()
+    elif hasattr(M_s1_dense, "values"):
+        M_s1_dense = cp.asarray(M_s1_dense.values)
+    elif not isinstance(M_s1_dense, cp.ndarray):
+        M_s1_dense = cp.asarray(M_s1_dense)
+
+    M_pool_dense = M_pool_dense.astype(cp.float32)
+    M_s1_dense = M_s1_dense.astype(cp.float32)
+
+    # Step 3: Normalize dense vectors to unit L2 norm using CuPy
+    pool_norms = cp.linalg.norm(M_pool_dense, axis=1, keepdims=True)
+    pool_norms = cp.maximum(pool_norms, 1e-12)
+    M_pool_dense = M_pool_dense / pool_norms
+
+    s1_norms = cp.linalg.norm(M_s1_dense, axis=1, keepdims=True)
+    s1_norms = cp.maximum(s1_norms, 1e-12)
+    M_s1_dense = M_s1_dense / s1_norms
+
+    actual_k = min(top_k, n_candidates)
+    matched_s1_list: List[np.ndarray] = []
+    matched_pool_list: List[np.ndarray] = []
+
+    # Step 4: Fit cuML NearestNeighbors (metric='cosine')
+    use_cuml_nn = True
+    nn = None
+    try:
+        from cuml.neighbors import NearestNeighbors as cuNearestNeighbors
+        try:
+            nn = cuNearestNeighbors(n_neighbors=actual_k, metric="cosine", output_type="cupy")
+        except TypeError:
+            nn = cuNearestNeighbors(n_neighbors=actual_k, metric="cosine")
+        nn.fit(M_pool_dense)
+    except Exception as e_nn:
+        logger.warning(
+            "cuML NearestNeighbors initialization/fit failed (%s); trying Faiss fallback.",
+            e_nn,
+        )
+        use_cuml_nn = False
+
+    # Step 5 & 6: Query S1 against candidate pool and filter by 1 - distances >= min_similarity
+    if use_cuml_nn and nn is not None:
+        try:
+            query_batch = max(1000, min(batch_size, 50000))
+            for q_start in tqdm(
+                range(0, n_s1, query_batch),
+                desc="cuML KNN Cosine Batches",
+                leave=False,
+            ):
+                q_end = min(q_start + query_batch, n_s1)
+                q_chunk = M_s1_dense[q_start:q_end]
+
+                distances, indices = nn.kneighbors(q_chunk)
+
+                if hasattr(distances, "to_cupy"):
+                    distances = distances.to_cupy()
+                elif hasattr(distances, "values"):
+                    distances = cp.asarray(distances.values)
+                elif not isinstance(distances, cp.ndarray):
+                    distances = cp.asarray(distances)
+
+                if hasattr(indices, "to_cupy"):
+                    indices = indices.to_cupy()
+                elif hasattr(indices, "values"):
+                    indices = cp.asarray(indices.values)
+                elif not isinstance(indices, cp.ndarray):
+                    indices = cp.asarray(indices)
+
+                # For cosine metric: similarity = 1 - distance
+                sims = 1.0 - distances
+                valid_mask = (sims >= min_similarity) & (indices >= 0)
+
+                if not bool(cp.any(valid_mask)):
+                    continue
+
+                chunk_rows = cp.broadcast_to(
+                    cp.arange(q_start, q_end, dtype=cp.int64)[:, None],
+                    indices.shape,
+                )
+
+                matched_s1_list.append(cp.asnumpy(chunk_rows[valid_mask]))
+                matched_pool_list.append(cp.asnumpy(indices[valid_mask]))
+        except Exception as e_query:
+            logger.warning(
+                "cuML kneighbors query encountered an issue (%s); falling back to Faiss.",
+                e_query,
+            )
+            use_cuml_nn = False
+            matched_s1_list.clear()
+            matched_pool_list.clear()
+
+    # Fallback to Faiss if cuML NearestNeighbors failed or was bypassed
+    if not use_cuml_nn or not matched_s1_list:
+        try:
+            import faiss
+            logger.info("Running Faiss IndexFlatIP on CPU for 128-dim dense matching...")
+            M_pool_np = cp.asnumpy(M_pool_dense)
+            M_s1_np = cp.asnumpy(M_s1_dense)
+            dim = M_pool_np.shape[1]
+
+            index = faiss.IndexFlatIP(dim)
+            index.add(M_pool_np)
+
+            query_batch = max(5000, min(batch_size, 100000))
+            for q_start in tqdm(
+                range(0, n_s1, query_batch),
+                desc="Faiss KNN IP Batches",
+                leave=False,
+            ):
+                q_end = min(q_start + query_batch, n_s1)
+                q_chunk = M_s1_np[q_start:q_end]
+
+                sims, indices = index.search(q_chunk, actual_k)
+                valid_mask = (sims >= min_similarity) & (indices >= 0)
+
+                if not np.any(valid_mask):
+                    continue
+
+                chunk_rows = np.broadcast_to(
+                    np.arange(q_start, q_end, dtype=np.int64)[:, None],
+                    indices.shape,
+                )
+                matched_s1_list.append(chunk_rows[valid_mask])
+                matched_pool_list.append(indices[valid_mask])
+        except Exception as e_faiss:
+            if not matched_s1_list:
+                logger.error("Faiss KNN fallback failed with %s", e_faiss)
+                raise
+
+    # Cleanup VRAM allocations
+    del M_pool_dense
+    del M_s1_dense
+    cp.get_default_memory_pool().free_all_blocks()
+
+    if matched_s1_list:
+        return np.concatenate(matched_s1_list), np.concatenate(matched_pool_list)
+    return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
+
 def gpu_sparse_dot_topk(
     M_s1,
     M_pool_T,
@@ -304,29 +540,18 @@ def _block_channel_tfidf_ngram_gpu(
         else:
             M_s1 = cp_sparse.csr_matrix(M_s1)
 
-    # Transpose candidate matrix to D x M and ensure CSR for fast dot product
-    M_pool_T = M_pool.T
-    if not isinstance(M_pool_T, cp_sparse.csr_matrix):
-        if hasattr(M_pool_T, "tocsr"):
-            M_pool_T = M_pool_T.tocsr()
-        else:
-            M_pool_T = cp_sparse.csr_matrix(M_pool_T)
-
-    # Free M_pool to maximize available VRAM for dot-product
-    del M_pool
-    cp.get_default_memory_pool().free_all_blocks()
-
-    # Query GPU top-K
-    s1_local_idx, pool_local_idx = gpu_sparse_dot_topk(
+    # Query GPU top-K using TruncatedSVD and NearestNeighbors (LSA cosine matching)
+    s1_local_idx, pool_local_idx = gpu_knn_lsa_topk(
         M_s1=M_s1,
-        M_pool_T=M_pool_T,
+        M_pool=M_pool,
         top_k=top_k,
         min_similarity=min_similarity,
+        n_components=128,
         batch_size=batch_size,
     )
 
     del M_s1
-    del M_pool_T
+    del M_pool
     cp.get_default_memory_pool().free_all_blocks()
 
     if len(s1_local_idx) == 0:
