@@ -58,7 +58,15 @@ except ImportError:
 
 def is_sparse_dot_topn_available() -> bool:
     """Returns True if sparse_dot_topn library is installed and available."""
-    return _SPARSE_DOT_TOPN_MODE is not None
+    is_avail = _SPARSE_DOT_TOPN_MODE is not None
+    if not is_avail:
+        logger.warning(
+            "\033[91;1m"
+            "[CRITICAL WARNING] 'sparse_dot_topn' is not active or failed to load. "
+            "Pipeline will fall back to slower execution."
+            "\033[0m"
+        )
+    return is_avail
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +277,15 @@ def block_channel_exact_key(
     if s1_sub.height == 0 or pool_sub.height == 0:
         return empty_res
 
+    # Cap high-frequency keys in S1 to prevent S1 combinatorial explosion
+    if max_candidates_per_key > 0:
+        s1_sub = (
+            s1_sub
+            .with_columns(pl.len().over(key_col).alias("_s1_freq"))
+            .filter(pl.col("_s1_freq") <= max_candidates_per_key)
+            .drop("_s1_freq")
+        )
+
     # Cap high-frequency keys in pool to max_candidates_per_key
     if max_candidates_per_key > 0:
         pool_sub = (
@@ -360,8 +377,11 @@ def block_channel_tfidf_ngram(
         analyzer="char_wb",
         ngram_range=ngram_range,
         min_df=10,
+        max_df=0.3,
+        max_features=100000,
         norm="l2",
         sublinear_tf=True,
+        dtype=np.float32,
     )
 
     try:
@@ -470,9 +490,24 @@ class MultiChannelBlocker:
             max_candidates_per_key=self.max_exact_per_key,
         )
 
+        # Combine exact match pairs to find how many candidates each S1 entity has
+        exact_pairs = pl.concat([pairs_c1, pairs_c2]).unique(subset=[s1_id_col, pool_id_col])
+
+        # Filter s1_df to only process S1 IDs that have fewer than max_candidates_per_s1 candidates
+        if exact_pairs.height > 0 and self.max_candidates_per_s1 > 0:
+            s1_cand_counts = exact_pairs.group_by(s1_id_col).agg(pl.len().alias("_cand_count"))
+            # S1 entities that already have enough candidates
+            satisfied_s1 = s1_cand_counts.filter(pl.col("_cand_count") >= self.max_candidates_per_s1)
+            if satisfied_s1.height > 0:
+                s1_df_tfidf = s1_df.join(satisfied_s1.select(s1_id_col), on=s1_id_col, how="anti")
+            else:
+                s1_df_tfidf = s1_df
+        else:
+            s1_df_tfidf = s1_df
+
         # Channel 3: TF-IDF char n-grams cosine similarity top-20 (multithreaded CPU)
         pairs_c3 = block_channel_tfidf_ngram(
-            s1_df=s1_df,
+            s1_df=s1_df_tfidf,
             pool_df=pool_df,
             text_col="name_no_legal",
             s1_id_col=s1_id_col,
