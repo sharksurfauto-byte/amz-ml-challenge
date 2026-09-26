@@ -123,9 +123,9 @@ def gpu_sparse_dot_topk(
     if n_s1 == 0 or n_candidates == 0 or top_k <= 0:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
 
-    # Calculate optimal GPU batch size to bound dense memory to ~20 GB (5 billion float32 elements)
-    max_dense_elements = 5_000_000_000
-    safe_gpu_batch = max(20, min(50000, max_dense_elements // max(1, n_candidates)))
+    # Calculate optimal GPU batch size to bound dense memory to ~2 GB to prevent cuSPARSE workspace explosions
+    max_dense_elements = 500_000_000
+    safe_gpu_batch = max(50, min(5000, max_dense_elements // max(1, n_candidates)))
 
     if batch_size is None or batch_size > safe_gpu_batch:
         effective_batch_size = safe_gpu_batch
