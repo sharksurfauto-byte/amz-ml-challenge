@@ -140,9 +140,13 @@ def block_channel_tfidf_ngram(
     try:
         if _HAS_CUML:
             import cudf
-            # CuML TfidfVectorizer requires cudf Series for text
-            M_pool = vectorizer.fit_transform(cudf.Series(pool_text_series))
-            M_s1 = vectorizer.transform(cudf.Series(s1_text_series))
+            pool_series = cudf.Series(pool_text_series)
+            pool_series.index = cudf.RangeIndex(0, len(pool_series))
+            M_pool = vectorizer.fit_transform(pool_series)
+
+            s1_series = cudf.Series(s1_text_series)
+            s1_series.index = cudf.RangeIndex(0, len(s1_series))
+            M_s1 = vectorizer.transform(s1_series)
         else:
             M_pool = vectorizer.fit_transform(pool_text_series)
             M_s1 = vectorizer.transform(s1_text_series)
@@ -190,6 +194,8 @@ def block_channel_tfidf_ngram(
 
     matched_s1 = s1_ids_arr[s1_local_idx]
     matched_pool = pool_ids_arr[pool_local_idx]
+
+    logger.info(f"LSA KNN found {len(matched_s1)} fuzzy matches.")
 
     return pl.DataFrame({
         s1_id_col: pl.Series(matched_s1, dtype=pl.UInt32),
