@@ -40,15 +40,8 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
-# GPU (CuPy) & sparse_dot_topn dynamic detection
+# sparse_dot_topn dynamic detection
 # ---------------------------------------------------------------------------
-_HAS_CUPY = False
-try:
-    import cupy as cp
-    import cupyx.scipy.sparse as cpx
-    _HAS_CUPY = True
-except ImportError:
-    _HAS_CUPY = False
 
 _SPARSE_DOT_TOPN_MODE: Optional[str] = None
 
@@ -156,50 +149,10 @@ def sparse_dot_topk(
 
     effective_threads = max(1, os.cpu_count() or 1) if n_jobs <= 0 else n_jobs
 
-    # 1. CuPy GPU Path
-    if _HAS_CUPY:
-        try:
-            logger.info("    [GPU] Accelerating sparse matrix dot product with CuPy...")
-            # We use smaller batches on the GPU to strictly prevent VRAM OOM on dense n-grams
-            # Calculate batch size dynamically to bound VRAM. 54GB for 2500 means ~22MB per row.
-            # We want max ~2GB allocated, so batch size around 50-100.
-            gpu_batch = max(50, 1_000_000 // max(1, n_candidates))
-            B_T_gpu = cpx.csr_matrix(B_T)
-            
-            all_r: List[np.ndarray] = []
-            all_c: List[np.ndarray] = []
-            
-            for start_idx in tqdm(range(0, n_queries, gpu_batch), desc="GPU Sparse Batches", leave=False):
-                end_idx = min(start_idx + gpu_batch, n_queries)
-                sub_A_gpu = cpx.csr_matrix(A[start_idx:end_idx])
-                
-                # O(N*M) heavy dot-product executed on GPU Cuda cores
-                sim_mat_gpu = sub_A_gpu.dot(B_T_gpu)
-                
-                # Fetch sparse result matrix back to host CPU for Top-K extraction
-                sim_mat_cpu = sim_mat_gpu.get()
-                r, c = _topk_from_csr(sim_mat_cpu, top_k=top_k, min_similarity=min_similarity)
-                
-                if len(r) > 0:
-                    all_r.append(r + start_idx)
-                    all_c.append(c)
-                
-                del sub_A_gpu, sim_mat_gpu, sim_mat_cpu
-                cp.get_default_memory_pool().free_all_blocks()
-                
-            del B_T_gpu
-            cp.get_default_memory_pool().free_all_blocks()
-            
-            if all_r:
-                return np.concatenate(all_r), np.concatenate(all_c)
-            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
-            
-        except Exception as e:
-            logger.warning("CuPy GPU acceleration failed: %s. Falling back to CPU...", e)
-
-    # 2. Native multithreaded C++ sparse_dot_topn path
+    # 1. Native multithreaded C++ sparse_dot_topn path
     if _SPARSE_DOT_TOPN_MODE == "sp_matmul_topn":
         try:
+            logger.info("[+] Executing C++ sparse_dot_topn OpenMP engine...")
             import sparse_dot_topn
 
             res_csr = sparse_dot_topn.sp_matmul_topn(
@@ -219,6 +172,7 @@ def sparse_dot_topk(
 
     elif _SPARSE_DOT_TOPN_MODE == "awesome_cossim_topn":
         try:
+            logger.info("[+] Executing C++ sparse_dot_topn OpenMP engine...")
             import sparse_dot_topn
 
             res_csr = sparse_dot_topn.awesome_cossim_topn(
@@ -402,20 +356,10 @@ def block_channel_tfidf_ngram(
     if not any(s1_text_series) or not any(pool_text_series):
         return empty_res
 
-    # Adaptive min_df to strictly prune vocabulary explosion on large datasets
-    if len(pool_text_series) > 1_000_000:
-        min_df = 10
-    elif len(pool_text_series) > 100_000:
-        min_df = 5
-    elif len(pool_text_series) > 100:
-        min_df = 2
-    else:
-        min_df = 1
-
     vectorizer = TfidfVectorizer(
-        analyzer="char_wb", # word boundary char n-grams dramatically cuts meaningless cross-word typos
+        analyzer="char_wb",
         ngram_range=ngram_range,
-        min_df=min_df,
+        min_df=10,
         norm="l2",
         sublinear_tf=True,
     )
