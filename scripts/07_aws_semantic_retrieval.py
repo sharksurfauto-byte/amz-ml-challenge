@@ -19,9 +19,13 @@ Requirements:
     - sentence-transformers, faiss-gpu, polars
 """
 
+import sys
+# Prevent HuggingFace transformers from importing broken conda torchvision C++ kernels
+# (e.g. 'operator torchvision::nms does not exist' in SageMaker Python 3.12 conda environments)
+sys.modules["torchvision"] = None
+
 import argparse
 import logging
-import sys
 import time
 from pathlib import Path
 from typing import List, Tuple
