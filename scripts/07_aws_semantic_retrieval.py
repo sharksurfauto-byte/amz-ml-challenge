@@ -377,28 +377,44 @@ def build_faiss_index(embeddings: np.ndarray, use_gpu: bool = True) -> "faiss.In
 def search_candidates(
     index: "faiss.Index",
     query_embeddings: np.ndarray,
-    top_k: int
+    top_k: int,
+    batch_size: int = 50000,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Search FAISS index for top-K nearest neighbors.
+    Search FAISS index for top-K nearest neighbors in memory-safe chunks.
 
     Args:
         index: FAISS index
         query_embeddings: Query vectors (N_queries, D)
         top_k: Number of neighbors to retrieve per query
+        batch_size: Batch size for search chunking
 
     Returns:
         (distances, indices) - both shape (N_queries, top_k)
     """
-    logger.info(f"Searching index for top-{top_k} candidates per query...")
+    n_queries = len(query_embeddings)
+    logger.info(f"Searching index for top-{top_k} candidates across {n_queries:,} queries (chunk size={batch_size:,})...")
     start_time = time.time()
 
-    distances, indices = index.search(query_embeddings.astype(np.float32), top_k)
+    all_dists = np.empty((n_queries, top_k), dtype=np.float32)
+    all_indices = np.empty((n_queries, top_k), dtype=np.int64)
+
+    for i in range(0, n_queries, batch_size):
+        end_idx = min(i + batch_size, n_queries)
+        sub_queries = query_embeddings[i:end_idx].astype(np.float32)
+        dists, idxs = index.search(sub_queries, top_k)
+        all_dists[i:end_idx] = dists
+        all_indices[i:end_idx] = idxs
+
+        if (i // batch_size) % 5 == 0 or end_idx >= n_queries:
+            elapsed = time.time() - start_time
+            rate = end_idx / elapsed if elapsed > 0 else 0
+            logger.info(f"  Searched {end_idx:,}/{n_queries:,} queries ({end_idx/n_queries*100:.1f}%) | {rate:.0f} queries/sec")
 
     elapsed = time.time() - start_time
-    logger.info(f"Search complete in {elapsed:.2f}s. Throughput: {len(query_embeddings) / elapsed:.0f} queries/sec")
+    logger.info(f"Search complete in {elapsed:.2f}s. Average throughput: {n_queries / elapsed:.0f} queries/sec")
 
-    return distances, indices
+    return all_dists, all_indices
 
 
 def build_candidate_dataframe(
