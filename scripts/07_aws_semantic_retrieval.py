@@ -222,13 +222,13 @@ class NativeTransformerEmbedder:
     conda metadata incompatibilities in Python 3.12 (e.g. TF_VERSION NoneType bug).
     """
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, device: str = "cuda"):
         from transformers import AutoTokenizer, AutoModel
         import torch
 
         hf_id = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
-        logger.info(f"Loading native HuggingFace model: {hf_id}...")
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Loading native HuggingFace model: {hf_id} on {device}...")
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(hf_id)
         self.model = AutoModel.from_pretrained(hf_id).to(self.device)
         self.model.eval()
@@ -273,64 +273,59 @@ class NativeTransformerEmbedder:
         return np.vstack(all_embs)
 
 
-def encode_with_multi_gpu(model, texts: List[str], batch_size: int, pool_size: int = None) -> np.ndarray:
+def encode_with_multi_gpu(model_or_name, texts: List[str], batch_size: int, model_name_str: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2") -> np.ndarray:
     """
-    Encode texts using multi-GPU parallelism with fallback.
-
-    Args:
-        model: SentenceTransformer model
-        texts: List of text strings
-        batch_size: Encoding batch size per GPU
-        pool_size: Number of processes (GPUs) to use, None = auto-detect
-
-    Returns:
-        Normalized embeddings as np.ndarray (N, embedding_dim)
+    Encode texts using all available GPUs in parallel (e.g. 4x L40S on ml.g6e.16xlarge).
+    Dispatches 1 independent model replica per GPU across parallel threads.
     """
-    try:
-        import torch
-        gpu_count = torch.cuda.device_count()
+    import torch
+    from concurrent.futures import ThreadPoolExecutor
 
-        if gpu_count > 1:
-            logger.info(f"Detected {gpu_count} GPUs. Starting multi-process pool...")
-            pool = model.start_multi_process_pool(target_devices=None)  # Auto-detect all GPUs
+    gpu_count = torch.cuda.device_count()
+    if gpu_count <= 1:
+        logger.info(f"Single GPU/CPU detected (gpu_count={gpu_count}). Using batched encode()...")
+        return encode_in_batches(model_or_name, texts, batch_size, "Single GPU/CPU encoding")
 
-            try:
-                # Encode in chunks to manage memory
-                chunk_size = 50000  # Process 50k texts at a time
-                all_embeddings = []
+    logger.info(f"Detected {gpu_count} GPUs. Distributing encoding across all {gpu_count} GPUs in parallel...")
+    n_texts = len(texts)
+    chunk_size = (n_texts + gpu_count - 1) // gpu_count
 
-                for i in range(0, len(texts), chunk_size):
-                    chunk_texts = texts[i:i + chunk_size]
-                    logger.info(f"Encoding chunk {i//chunk_size + 1}/{(len(texts)-1)//chunk_size + 1} "
-                              f"({len(chunk_texts):,} texts)")
+    resolved_name = getattr(model_or_name, "model_name_or_path", None) or model_name_str
 
-                    chunk_embeddings = model.encode_multi_process(
-                        chunk_texts,
-                        pool,
-                        batch_size=batch_size,
-                        normalize_embeddings=True,
-                        show_progress_bar=True
-                    )
-                    all_embeddings.append(chunk_embeddings)
+    def _worker(gpu_id: int) -> Tuple[int, int, np.ndarray]:
+        st = gpu_id * chunk_size
+        en = min(st + chunk_size, n_texts)
+        if st >= n_texts:
+            return st, en, np.empty((0, 384), dtype=np.float32)
 
-                embeddings = np.vstack(all_embeddings)
-                logger.info(f"Multi-GPU encoding complete. Shape: {embeddings.shape}")
-                return embeddings
-            finally:
-                model.stop_multi_process_pool(pool)
+        sub_texts = texts[st:en]
+        logger.info(f"  [GPU {gpu_id}] Initializing model replica on cuda:{gpu_id} ({len(sub_texts):,} texts)...")
+        embedder = NativeTransformerEmbedder(resolved_name, device=f"cuda:{gpu_id}")
+        sub_embs = encode_in_batches(embedder, sub_texts, batch_size, f"GPU {gpu_id}")
+        return st, en, sub_embs
 
-        else:
-            logger.info(f"Single GPU/CPU detected. Using batched encode()...")
-            return encode_in_batches(model, texts, batch_size, "Single device encoding")
+    with ThreadPoolExecutor(max_workers=gpu_count) as executor:
+        results = list(executor.map(_worker, range(gpu_count)))
 
-    except Exception as e:
-        logger.warning(f"Multi-GPU encoding failed: {e}. Falling back to batched CPU/single-GPU...")
-        return encode_in_batches(model, texts, batch_size, "Fallback encoding")
+    dim = 384
+    for _, _, embs in results:
+        if embs.shape[0] > 0:
+            dim = embs.shape[1]
+            break
+
+    all_embeddings = np.empty((n_texts, dim), dtype=np.float32)
+    for st, en, embs in results:
+        if embs.shape[0] > 0:
+            all_embeddings[st:en] = embs
+
+    logger.info(f"Multi-GPU encoding across all {gpu_count} GPUs completed. Shape: {all_embeddings.shape}")
+    return all_embeddings
 
 
 def build_faiss_index(embeddings: np.ndarray, use_gpu: bool = True) -> "faiss.Index":
     """
     Build FAISS IndexFlatIP (Inner Product for cosine similarity).
+    Distributes across all GPUs on multi-GPU instances (e.g. 4x L40S on ml.g6e.16xlarge).
 
     Args:
         embeddings: Normalized embeddings (N, D)
@@ -344,18 +339,32 @@ def build_faiss_index(embeddings: np.ndarray, use_gpu: bool = True) -> "faiss.In
     dimension = embeddings.shape[1]
     logger.info(f"Building FAISS IndexFlatIP with dimension {dimension}...")
 
-    index = faiss.IndexFlatIP(dimension)  # Inner Product (cosine sim for normalized vectors)
+    index = faiss.IndexFlatIP(dimension)
 
-    # Try to move to GPU
+    # Move to GPU(s)
     if use_gpu:
         try:
-            res = faiss.StandardGpuResources()
-            # Set temp memory buffer to 1.5 GB to prevent allocation crashes on large vector pools
-            res.setTempMemory(1536 * 1024 * 1024)
-            index = faiss.index_cpu_to_gpu(res, 0, index)
-            logger.info("FAISS index successfully moved to GPU with 1.5GB temp buffer")
+            gpu_count = faiss.get_num_gpus()
+            if gpu_count > 1:
+                logger.info(f"Detected {gpu_count} GPUs in FAISS. Sharding index across all GPUs...")
+                co = faiss.GpuMultipleClonerOptions()
+                co.shard = True
+                index = faiss.index_cpu_to_all_gpus(index, co, ngpu=gpu_count)
+                logger.info(f"FAISS index successfully sharded across {gpu_count} GPUs")
+            elif gpu_count == 1:
+                res = faiss.StandardGpuResources()
+                res.setTempMemory(1536 * 1024 * 1024)
+                index = faiss.index_cpu_to_gpu(res, 0, index)
+                logger.info("FAISS index successfully moved to single GPU")
         except Exception as e:
-            logger.warning(f"Could not move FAISS index to GPU: {e}. Using multithreaded CPU index.")
+            logger.warning(f"Could not initialize GPU FAISS: {e}. Using multithreaded CPU index.")
+
+    # Add vectors
+    logger.info(f"Adding {len(embeddings):,} vectors to index...")
+    index.add(embeddings.astype(np.float32))
+    logger.info(f"Index built. Total vectors: {index.ntotal:,}")
+
+    return index
 
     # Add vectors
     logger.info(f"Adding {len(embeddings):,} vectors to index...")
@@ -524,13 +533,13 @@ def main():
     logger.info("=" * 80)
     logger.info("Encoding pool (S2 + S3)...")
     logger.info("=" * 80)
-    pool_embeddings = encode_with_multi_gpu(model, pool_texts, args.batch_size)
+    pool_embeddings = encode_with_multi_gpu(model, pool_texts, args.batch_size, args.model_name)
 
     # Encode queries (S1)
     logger.info("=" * 80)
     logger.info("Encoding queries (S1)...")
     logger.info("=" * 80)
-    s1_embeddings = encode_with_multi_gpu(model, s1_texts, args.batch_size)
+    s1_embeddings = encode_with_multi_gpu(model, s1_texts, args.batch_size, args.model_name)
 
     # Build FAISS index
     logger.info("=" * 80)
