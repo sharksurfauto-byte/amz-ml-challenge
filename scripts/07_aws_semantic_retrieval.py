@@ -90,6 +90,20 @@ def format_entity_text(df: pl.DataFrame) -> List[str]:
     return texts
 
 
+def resolve_split_path(data_dir: Path, split: str, filename: str) -> Path:
+    """Resolves file path checking split subdirectory first, then data_dir."""
+    candidates = [
+        data_dir / split / filename,
+        data_dir / filename,
+        REPO_ROOT / "data" / "parquet" / split / filename,
+        REPO_ROOT / "data" / "parquet" / filename,
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"Could not find '{filename}' for split '{split}' in {[str(c) for c in candidates]}")
+
+
 def load_and_prepare_data(split: str, data_dir: Path) -> Tuple[pl.DataFrame, pl.DataFrame, List[str], List[str]]:
     """
     Load S1 queries and S2+S3 pool, format as text.
@@ -104,48 +118,55 @@ def load_and_prepare_data(split: str, data_dir: Path) -> Tuple[pl.DataFrame, pl.
     logger.info(f"Loading {split} data from {data_dir}...")
 
     # Load S1 (queries)
-    s1_path = data_dir / f"{split}_source1.parquet"
-    if not s1_path.exists():
-        raise FileNotFoundError(f"Source1 file not found: {s1_path}")
+    s1_path = resolve_split_path(data_dir, split, f"{split}_source1.parquet")
     s1_df = pl.read_parquet(s1_path)
-    logger.info(f"Loaded {len(s1_df):,} S1 entities")
+    logger.info(f"Loaded {len(s1_df):,} S1 entities from {s1_path}")
 
     # Load S2
-    s2_path = data_dir / f"{split}_source2.parquet"
-    if not s2_path.exists():
-        raise FileNotFoundError(f"Source2 file not found: {s2_path}")
+    s2_path = resolve_split_path(data_dir, split, f"{split}_source2.parquet")
     s2_df = pl.read_parquet(s2_path)
-    logger.info(f"Loaded {len(s2_df):,} S2 records")
+    logger.info(f"Loaded {len(s2_df):,} S2 records from {s2_path}")
 
     # Load S3
-    s3_path = data_dir / f"{split}_source3.parquet"
-    if not s3_path.exists():
-        raise FileNotFoundError(f"Source3 file not found: {s3_path}")
+    s3_path = resolve_split_path(data_dir, split, f"{split}_source3.parquet")
     s3_df = pl.read_parquet(s3_path)
-    logger.info(f"Loaded {len(s3_df):,} S3 records")
+    logger.info(f"Loaded {len(s3_df):,} S3 records from {s3_path}")
 
-    # Verify required ID columns exist
-    required_id_cols = ["source1_entity_id_int"]
-    for col in required_id_cols:
-        if col not in s1_df.columns:
-            raise ValueError(f"Required column '{col}' not found in {s1_path}")
+    # Resolve id_map if available
+    id_map = None
+    for p in [data_dir / "id_map.parquet", REPO_ROOT / "data" / "parquet" / "id_map.parquet"]:
+        if p.exists():
+            id_map = pl.read_parquet(p)
+            break
 
-    # Concatenate S2 + S3 as pool
-    pool_df = pl.concat([s2_df, s3_df], how="vertical")
+    # Ensure source1_entity_id_int in s1_df
+    if "source1_entity_id_int" not in s1_df.columns:
+        if "entity_id_int" in s1_df.columns:
+            s1_df = s1_df.with_columns(pl.col("entity_id_int").alias("source1_entity_id_int"))
+        elif id_map is not None and "entity_id" in s1_df.columns:
+            s1_df = s1_df.join(id_map.rename({"entity_id_int": "source1_entity_id_int"}), on="entity_id", how="left")
+        else:
+            s1_df = s1_df.with_columns(pl.int_range(0, pl.len(), dtype=pl.UInt32).alias("source1_entity_id_int"))
+
+    s1_df = s1_df.with_columns(pl.col("source1_entity_id_int").cast(pl.UInt32))
+
+    # Ensure candidate entity_id_int in s2_df and s3_df
+    for df_name, df_ref in [("s2", s2_df), ("s3", s3_df)]:
+        cand_id_col = "candidate_entity_id_int" if "candidate_entity_id_int" in df_ref.columns else "entity_id_int"
+        if cand_id_col not in df_ref.columns:
+            if id_map is not None and "entity_id" in df_ref.columns:
+                df_ref = df_ref.join(id_map, on="entity_id", how="left")
+            else:
+                df_ref = df_ref.with_columns(pl.int_range(0, pl.len(), dtype=pl.UInt32).alias("entity_id_int"))
+        if df_name == "s2":
+            s2_df = df_ref.with_columns(pl.col("entity_id_int" if "entity_id_int" in df_ref.columns else cand_id_col).cast(pl.UInt32).alias("entity_id_int"))
+        else:
+            s3_df = df_ref.with_columns(pl.col("entity_id_int" if "entity_id_int" in df_ref.columns else cand_id_col).cast(pl.UInt32).alias("entity_id_int"))
+
+    # Common schema projection before vertical concat
+    common_cols = [c for c in ["entity_id_int", "name_no_legal", "business_name", "address_clean", "address", "business_address", "country"] if c in s2_df.columns and c in s3_df.columns]
+    pool_df = pl.concat([s2_df.select(common_cols), s3_df.select(common_cols)], how="vertical")
     logger.info(f"Combined pool size: {len(pool_df):,} records")
-
-    # Verify pool ID column exists
-    if "entity_id_int" not in pool_df.columns:
-        # Try alternative names
-        id_candidates = ["source2_entity_id_int", "source3_entity_id_int", "entity_id"]
-        found = False
-        for col in id_candidates:
-            if col in pool_df.columns:
-                pool_df = pool_df.with_columns(pl.col(col).alias("entity_id_int"))
-                found = True
-                break
-        if not found:
-            raise ValueError("Could not find entity ID column in S2/S3 data")
 
     # Format as text
     s1_texts = format_entity_text(s1_df)
