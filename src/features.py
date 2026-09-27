@@ -30,15 +30,27 @@ if not logger.handlers:
 # ---------------------------------------------------------------------------
 FEATURE_COLUMNS: List[str] = [
     "name_len_diff",
+    "name_len_ratio",
     "name_jaro",
+    "name_jaro_winkler",
     "name_token_set_ratio",
     "name_token_sort_ratio",
+    "name_partial_ratio",
+    "exact_clean_name",
     "exact_legal_match",
     "address_jaro",
+    "address_token_set_ratio",
+    "address_token_sort_ratio",
+    "both_have_address",
     "exact_street_num_match",
+    "exact_pincode_match",
     "domain_root_match",
+    "has_s3_domain",
     "cands_per_s1",
     "claims_per_cand",
+    "priority_rank",
+    "channel_mask",
+    "semantic_score",
 ]
 
 # Legacy feature names maintained for backward compatibility
@@ -120,16 +132,20 @@ def _compute_string_features_chunk(
     cand_names: List[str],
     s1_addrs: List[str],
     cand_addrs: List[str],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Computes rapidfuzz string distances for a chunk of paired strings.
     Pre-allocates float32 numpy arrays for minimal memory footprint and maximum speed.
     """
     n_rows = len(s1_names)
     name_jaro = np.empty(n_rows, dtype=np.float32)
+    name_jw = np.empty(n_rows, dtype=np.float32)
     name_token_set = np.empty(n_rows, dtype=np.float32)
     name_token_sort = np.empty(n_rows, dtype=np.float32)
+    name_partial = np.empty(n_rows, dtype=np.float32)
     address_jaro = np.empty(n_rows, dtype=np.float32)
+    address_token_set = np.empty(n_rows, dtype=np.float32)
+    address_token_sort = np.empty(n_rows, dtype=np.float32)
 
     for i in range(n_rows):
         s1_n = s1_names[i]
@@ -139,19 +155,36 @@ def _compute_string_features_chunk(
 
         if s1_n and c_n:
             name_jaro[i] = distance.Jaro.similarity(s1_n, c_n)
+            name_jw[i] = distance.JaroWinkler.similarity(s1_n, c_n)
             name_token_set[i] = fuzz.token_set_ratio(s1_n, c_n) / 100.0
             name_token_sort[i] = fuzz.token_sort_ratio(s1_n, c_n) / 100.0
+            name_partial[i] = fuzz.partial_ratio(s1_n, c_n) / 100.0
         else:
             name_jaro[i] = 0.0
+            name_jw[i] = 0.0
             name_token_set[i] = 0.0
             name_token_sort[i] = 0.0
+            name_partial[i] = 0.0
 
         if s1_a and c_a:
             address_jaro[i] = distance.Jaro.similarity(s1_a, c_a)
+            address_token_set[i] = fuzz.token_set_ratio(s1_a, c_a) / 100.0
+            address_token_sort[i] = fuzz.token_sort_ratio(s1_a, c_a) / 100.0
         else:
             address_jaro[i] = 0.0
+            address_token_set[i] = 0.0
+            address_token_sort[i] = 0.0
 
-    return name_jaro, name_token_set, name_token_sort, address_jaro
+    return (
+        name_jaro,
+        name_jw,
+        name_token_set,
+        name_token_sort,
+        name_partial,
+        address_jaro,
+        address_token_set,
+        address_token_sort,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +298,12 @@ def build_pairwise_features(
         else:
             exprs.append(pl.lit("").alias(f"{prefix}_address_street_number"))
 
+        # pincode
+        if "pincode" in df.columns:
+            exprs.append(pl.col("pincode").fill_null("").cast(pl.String).alias(f"{prefix}_pincode"))
+        else:
+            exprs.append(pl.lit("").alias(f"{prefix}_pincode"))
+
         return df.select(exprs)
 
     s1_sub = _prepare_metadata_table(s1_df, s1_id_in_s1, s1_id_col, "s1")
@@ -284,8 +323,28 @@ def build_pairwise_features(
         "s1_legal_form", "cand_legal_form",
         "s1_domain_root", "cand_domain_root",
         "s1_address_street_number", "cand_address_street_number",
+        "s1_pincode", "cand_pincode",
     ]
     joined = joined.with_columns([pl.col(c).fill_null("") for c in str_cols_to_fill])
+
+    # Ensure provenance and semantic columns exist with defaults if missing
+    prov_exprs = []
+    if "priority_rank" not in joined.columns:
+        prov_exprs.append(pl.lit(1, dtype=pl.UInt8).alias("priority_rank"))
+    else:
+        prov_exprs.append(pl.col("priority_rank").cast(pl.UInt8))
+
+    if "channel_mask" not in joined.columns:
+        prov_exprs.append(pl.lit(1, dtype=pl.UInt8).alias("channel_mask"))
+    else:
+        prov_exprs.append(pl.col("channel_mask").cast(pl.UInt8))
+
+    if "semantic_score" not in joined.columns:
+        prov_exprs.append(pl.lit(0.0, dtype=pl.Float32).alias("semantic_score"))
+    else:
+        prov_exprs.append(pl.col("semantic_score").cast(pl.Float32))
+
+    joined = joined.with_columns(prov_exprs)
 
     # 4. Polars native expressions: structural, length diff, exact matches, domain root match
     polars_features = [
@@ -295,6 +354,23 @@ def build_pairwise_features(
             pl.col("s1_name_clean").str.len_bytes().cast(pl.Int32)
             - pl.col("cand_name_clean").str.len_bytes().cast(pl.Int32)
         ).abs().cast(pl.Float32).alias("name_len_diff"),
+        (
+            pl.col("s1_name_clean").str.len_bytes().cast(pl.Float32)
+            / pl.max_horizontal([
+                pl.col("s1_name_clean").str.len_bytes().cast(pl.Float32),
+                pl.col("cand_name_clean").str.len_bytes().cast(pl.Float32),
+                pl.lit(1.0, dtype=pl.Float32),
+            ])
+        ).alias("name_len_ratio"),
+        pl.when(
+            (pl.col("s1_name_clean") != "")
+            & (pl.col("cand_name_clean") != "")
+            & (pl.col("s1_name_clean") == pl.col("cand_name_clean"))
+        )
+        .then(1.0)
+        .otherwise(0.0)
+        .cast(pl.Float32)
+        .alias("exact_clean_name"),
         pl.when(
             (pl.col("s1_legal_form") != "")
             & (pl.col("cand_legal_form") != "")
@@ -307,6 +383,14 @@ def build_pairwise_features(
         .cast(pl.Float32)
         .alias("exact_legal_match"),
         pl.when(
+            (pl.col("s1_address_clean") != "")
+            & (pl.col("cand_address_clean") != "")
+        )
+        .then(1.0)
+        .otherwise(0.0)
+        .cast(pl.Float32)
+        .alias("both_have_address"),
+        pl.when(
             (pl.col("s1_address_street_number") != "")
             & (pl.col("cand_address_street_number") != "")
             & (pl.col("s1_address_street_number") == pl.col("cand_address_street_number"))
@@ -317,6 +401,17 @@ def build_pairwise_features(
         .otherwise(-1.0)
         .cast(pl.Float32)
         .alias("exact_street_num_match"),
+        pl.when(
+            (pl.col("s1_pincode") != "")
+            & (pl.col("cand_pincode") != "")
+            & (pl.col("s1_pincode") == pl.col("cand_pincode"))
+        )
+        .then(1.0)
+        .when((pl.col("s1_pincode") != "") & (pl.col("cand_pincode") != ""))
+        .then(0.0)
+        .otherwise(-1.0)
+        .cast(pl.Float32)
+        .alias("exact_pincode_match"),
         pl.when(
             (pl.col("cand_domain_root") != "")
             & (
@@ -330,11 +425,16 @@ def build_pairwise_features(
         .otherwise(0.0)
         .cast(pl.Float32)
         .alias("domain_root_match"),
+        pl.when(pl.col("cand_domain_root") != "")
+        .then(1.0)
+        .otherwise(0.0)
+        .cast(pl.Float32)
+        .alias("has_s3_domain"),
     ]
 
     joined = joined.with_columns(polars_features)
 
-    # 5. Multithreaded RapidFuzz string distances (name_jaro, name_token_set_ratio, name_token_sort_ratio, address_jaro)
+    # 5. Multithreaded RapidFuzz string distances
     num_workers = os.cpu_count() or 4 if n_jobs <= 0 else n_jobs
     total_rows = joined.height
 
@@ -361,16 +461,24 @@ def build_pairwise_features(
         chunk_results = [_compute_string_features_chunk(*c) for c in chunk_slices]
 
     name_jaro_arr = np.concatenate([r[0] for r in chunk_results])
-    name_token_set_arr = np.concatenate([r[1] for r in chunk_results])
-    name_token_sort_arr = np.concatenate([r[2] for r in chunk_results])
-    address_jaro_arr = np.concatenate([r[3] for r in chunk_results])
+    name_jw_arr = np.concatenate([r[1] for r in chunk_results])
+    name_token_set_arr = np.concatenate([r[2] for r in chunk_results])
+    name_token_sort_arr = np.concatenate([r[3] for r in chunk_results])
+    name_partial_arr = np.concatenate([r[4] for r in chunk_results])
+    address_jaro_arr = np.concatenate([r[5] for r in chunk_results])
+    address_token_set_arr = np.concatenate([r[6] for r in chunk_results])
+    address_token_sort_arr = np.concatenate([r[7] for r in chunk_results])
 
     # 6. Attach computed string distance features as Polars Series
     joined = joined.with_columns([
         pl.Series("name_jaro", name_jaro_arr, dtype=pl.Float32),
+        pl.Series("name_jaro_winkler", name_jw_arr, dtype=pl.Float32),
         pl.Series("name_token_set_ratio", name_token_set_arr, dtype=pl.Float32),
         pl.Series("name_token_sort_ratio", name_token_sort_arr, dtype=pl.Float32),
+        pl.Series("name_partial_ratio", name_partial_arr, dtype=pl.Float32),
         pl.Series("address_jaro", address_jaro_arr, dtype=pl.Float32),
+        pl.Series("address_token_set_ratio", address_token_set_arr, dtype=pl.Float32),
+        pl.Series("address_token_sort_ratio", address_token_sort_arr, dtype=pl.Float32),
     ])
 
     # 7. Drop intermediate text columns to conserve memory

@@ -63,7 +63,7 @@ def ensure_metadata_columns(df: pl.DataFrame, is_source3: bool = False) -> pl.Da
     name_clean, address_clean, legal_form, domain_root, address_street_number.
     Computes them on the fly if missing.
     """
-    needed = ["name_clean", "address_clean", "legal_form", "domain_root", "address_street_number"]
+    needed = ["name_clean", "address_clean", "legal_form", "domain_root", "address_street_number", "pincode"]
     missing = [c for c in needed if c not in df.columns]
 
     if not missing:
@@ -76,7 +76,7 @@ def ensure_metadata_columns(df: pl.DataFrame, is_source3: bool = False) -> pl.Da
     name_prep = kanan_transliterate_devanagari(remove_junk_tokens(bname))
     cleaned_name = clean_text(name_prep)
     no_legal, legal_form = extract_and_remove_legal_forms(cleaned_name)
-    clean_addr, street_num = address_keys(baddr)
+    clean_addr, street_num, pcode = address_keys(baddr)
     domain_expr = extract_domain_root(bname) if is_source3 else pl.lit(None, dtype=pl.String)
 
     exprs = []
@@ -88,6 +88,8 @@ def ensure_metadata_columns(df: pl.DataFrame, is_source3: bool = False) -> pl.Da
         exprs.append(clean_addr.alias("address_clean"))
     if "address_street_number" in missing:
         exprs.append(street_num.alias("address_street_number"))
+    if "pincode" in missing:
+        exprs.append(pcode.alias("pincode"))
     if "domain_root" in missing:
         exprs.append(domain_expr.alias("domain_root"))
 
@@ -137,7 +139,7 @@ def load_entity_tables(
     df_s3 = ensure_metadata_columns(df_s3, is_source3=True)
 
     # Standardize column selections
-    metadata_cols = ["name_clean", "address_clean", "legal_form", "domain_root", "address_street_number"]
+    metadata_cols = ["name_clean", "address_clean", "legal_form", "domain_root", "address_street_number", "pincode"]
 
     s1_id_col = "source1_entity_id_int" if "source1_entity_id_int" in df_s1.columns else "entity_id_int"
     s1_clean = df_s1.select([pl.col(s1_id_col).cast(pl.UInt32).alias("source1_entity_id_int")] + [

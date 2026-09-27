@@ -113,12 +113,23 @@ def find_optimal_threshold(
 
     logger.info("Scanning %d thresholds from %.2f to %.2f for Macro F0.5 optimization...", len(thresholds), thresholds[0], thresholds[-1])
 
+    # Sort by probability descending once for fast mutual exclusion evaluation
+    order = np.argsort(-dev_probs)
+    sorted_s1 = [s1_list[i] for i in order]
+    sorted_cand = [cand_list[i] for i in order]
+    sorted_p = dev_probs[order]
+
     for thresh in thresholds:
-        # Build predictions dict for current threshold
         pred_map: Dict[str, Set[str]] = {s1: set() for s1 in gt_map.keys()}
-        for s1, c, p in zip(s1_list, cand_list, dev_probs):
-            if p >= thresh and s1 in pred_map:
-                pred_map[s1].add(c)
+        claimed: Set[str] = set()
+
+        for s1, c, p in zip(sorted_s1, sorted_cand, sorted_p):
+            if p < thresh:
+                break
+            if c not in claimed and s1 in pred_map:
+                if len(pred_map[s1]) < 11:
+                    pred_map[s1].add(c)
+                    claimed.add(c)
 
         metrics = evaluate_predictions(gt_map, pred_map)
         f05 = metrics.get("macro_F05", 0.0)
@@ -273,6 +284,29 @@ def train_gbdt_ranker(
             verbose=True,
         )
         dev_probs = model.predict_proba(X_dev)[:, 1]
+
+    elif model_type == "catboost":
+        import catboost as cb
+
+        logger.info("Initializing CatBoost Classifier...")
+        model = cb.CatBoostClassifier(
+            iterations=n_estimators,
+            learning_rate=learning_rate,
+            depth=max_depth,
+            loss_function="Logloss",
+            eval_metric="Logloss",
+            random_seed=42,
+            thread_count=num_threads,
+            verbose=50,
+        )
+        model.fit(
+            X_train,
+            y_train,
+            eval_set=(X_dev, y_dev),
+            early_stopping_rounds=early_stopping_rounds if early_stopping_rounds > 0 else None,
+            verbose=50,
+        )
+        dev_probs = model.predict_proba(X_dev)[:, 1]
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -410,7 +444,7 @@ def main():
         "--model-type",
         type=str,
         default="lgbm",
-        choices=["lgbm", "xgb"],
+        choices=["lgbm", "xgb", "catboost"],
         help="GBDT model architecture (default: lgbm)",
     )
     parser.add_argument(

@@ -70,8 +70,11 @@ def build_key_expressions(is_source3: bool = False) -> List[pl.Expr]:
         .otherwise(token_sort_key(cleaned_name))
     )
 
+    from src.normalize import extract_first_two_tokens
+    t0, t1 = extract_first_two_tokens(cleaned_name)
+
     # Address normalization pipeline
-    clean_addr, street_num = address_keys(baddr)
+    clean_addr, street_num, pincode = address_keys(baddr)
 
     # Domain root extraction (Source 3 web records only)
     domain_expr = (
@@ -85,8 +88,11 @@ def build_key_expressions(is_source3: bool = False) -> List[pl.Expr]:
         no_legal.alias("name_no_legal"),
         legal_form.alias("legal_form"),
         sorted_key.alias("name_token_sorted_key"),
+        t0.alias("first_token"),
+        t1.alias("second_token"),
         clean_addr.alias("address_clean"),
         street_num.alias("address_street_number"),
+        pincode.alias("pincode"),
         domain_expr.alias("domain_root"),
     ]
 

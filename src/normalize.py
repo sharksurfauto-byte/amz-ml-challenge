@@ -250,13 +250,94 @@ def extract_and_remove_legal_forms(expr: pl.Expr) -> Tuple[pl.Expr, pl.Expr]:
     return no_legal_expr, legal_form_expr
 
 
+EXCLUDED_EMAIL_DOMAINS = {
+    "gmail", "yahoo", "hotmail", "outlook", "rediffmail",
+    "aol", "icloud", "live", "ymail", "msn", "mail", "zoho"
+}
+
+_EMAIL_EXCLUDE_PATTERN = r"^(?:" + "|".join(EXCLUDED_EMAIL_DOMAINS) + r")$"
+
+
 def extract_domain_root(expr: pl.Expr) -> pl.Expr:
     """
-    Extracts the root domain name for Source 3 web records.
+    Extracts the clean second-level domain name for web records,
+    filtering out generic email providers (gmail, yahoo, etc.).
     e.g. 'wilfordhancock.com' -> 'wilfordhancock', 'www.example.net' -> 'example'.
     """
     pattern = r"(?:https?://)?(?:www\.)?([a-zA-Z0-9-]+)\.(?:com|net|org|in|co|us|biz|info|io|fr|gov|edu)\b"
-    return expr.str.extract(pattern, 1).str.to_lowercase()
+    extracted = expr.cast(pl.String).str.extract(pattern, 1).str.to_lowercase()
+    return (
+        pl.when(extracted.is_not_null() & ~extracted.str.contains(_EMAIL_EXCLUDE_PATTERN))
+        .then(extracted)
+        .otherwise(None)
+    )
+
+
+def extract_pincode(expr: pl.Expr) -> pl.Expr:
+    """
+    Extracts 5 or 6 digit postal / pin codes from address.
+    """
+    return expr.cast(pl.String).str.extract(r"\b(\d{5,6})\b", 1)
+
+
+def soundex(text: Optional[str]) -> Optional[str]:
+    """
+    Pure Python Soundex algorithm for phonetic key encoding.
+    Returns 4-character soundex code (e.g. 'S530').
+    """
+    if not text or not isinstance(text, str):
+        return None
+    s = [c for c in text.upper() if 'A' <= c <= 'Z']
+    if not s:
+        return None
+    first = s[0]
+    mapping = {
+        'B': '1', 'F': '1', 'P': '1', 'V': '1',
+        'C': '2', 'G': '2', 'J': '2', 'K': '2', 'Q': '2', 'S': '2', 'X': '2', 'Z': '2',
+        'D': '3', 'T': '3',
+        'L': '4',
+        'M': '5', 'N': '5',
+        'R': '6'
+    }
+    encoded = [first]
+    prev = mapping.get(first, '0')
+    for char in s[1:]:
+        code = mapping.get(char, '0')
+        if code != '0':
+            if code != prev:
+                encoded.append(code)
+            prev = code
+        else:
+            prev = '0'
+    res = ''.join(encoded)[:4]
+    return res.ljust(4, '0')
+
+
+def phonetic_first_token(expr: pl.Expr) -> pl.Expr:
+    """
+    Computes soundex code on the first distinctive token of the business name.
+    """
+    first_tok = (
+        expr.cast(pl.String)
+        .str.split(" ")
+        .list.eval(pl.element().filter(pl.element().str.len_chars() >= 3))
+        .list.get(0, null_on_oob=True)
+    )
+    return first_tok.map_elements(soundex, return_dtype=pl.String)
+
+
+def extract_first_two_tokens(expr: pl.Expr) -> Tuple[pl.Expr, pl.Expr]:
+    """
+    Extracts the first two distinctive words (>= 3 chars) from cleaned business name.
+    """
+    tokens = (
+        expr.cast(pl.String)
+        .str.split(" ")
+        .list.eval(pl.element().filter(pl.element().str.len_chars() >= 3))
+    )
+    t0 = tokens.list.get(0, null_on_oob=True)
+    t1 = tokens.list.get(1, null_on_oob=True)
+    return t0, t1
 
 
 def token_sort_key(expr: pl.Expr) -> pl.Expr:
@@ -274,9 +355,9 @@ def token_sort_key(expr: pl.Expr) -> pl.Expr:
 
 def extract_street_number(expr: pl.Expr) -> pl.Expr:
     """
-    Pulls out the first occurring sequence of digits as street_number.
+    Pulls out the first occurring sequence of digits (1-5 digits) as street_number.
     """
-    return expr.cast(pl.String).str.extract(r"(\d+)", 1)
+    return expr.cast(pl.String).str.extract(r"\b(\d{1,5})\b", 1)
 
 
 def clean_address(expr: pl.Expr) -> pl.Expr:
@@ -289,8 +370,11 @@ def clean_address(expr: pl.Expr) -> pl.Expr:
     return clean_text(remove_junk_tokens(kanan_transliterate_devanagari(expr)))
 
 
-def address_keys(expr: pl.Expr) -> Tuple[pl.Expr, pl.Expr]:
+def address_keys(expr: pl.Expr) -> Tuple[pl.Expr, pl.Expr, pl.Expr]:
     """
-    Returns (address_clean, address_street_number).
+    Returns (address_clean, address_street_number, pincode).
     """
-    return clean_address(expr), extract_street_number(expr)
+    cleaned = clean_address(expr)
+    street_num = extract_street_number(expr)
+    pincode = extract_pincode(expr)
+    return cleaned, street_num, pincode

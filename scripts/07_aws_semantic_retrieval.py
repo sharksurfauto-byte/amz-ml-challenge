@@ -156,7 +156,7 @@ def load_and_prepare_data(split: str, data_dir: Path) -> Tuple[pl.DataFrame, pl.
 
 def encode_in_batches(model, texts: List[str], batch_size: int, description: str = "Encoding") -> np.ndarray:
     """
-    Encode texts in batches to manage memory usage.
+    Encode texts in pre-allocated array with GPU acceleration and progress tracking.
 
     Args:
         model: SentenceTransformer model
@@ -167,25 +167,30 @@ def encode_in_batches(model, texts: List[str], batch_size: int, description: str
     Returns:
         Normalized embeddings as np.ndarray (N, embedding_dim)
     """
-    logger.info(f"{description} {len(texts):,} texts in batches of {batch_size}...")
+    dim = model.get_sentence_embedding_dimension()
+    n_texts = len(texts)
+    logger.info(f"{description} {n_texts:,} texts (embedding dim={dim}) with batch_size={batch_size}...")
 
-    all_embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i + batch_size]
-        batch_embeddings = model.encode(
+    embeddings = np.empty((n_texts, dim), dtype=np.float32)
+    t0 = time.time()
+
+    for i in range(0, n_texts, batch_size):
+        end_idx = min(i + batch_size, n_texts)
+        batch_texts = texts[i:end_idx]
+        batch_embs = model.encode(
             batch_texts,
             batch_size=len(batch_texts),
             normalize_embeddings=True,
             show_progress_bar=False,
-            convert_to_numpy=True
+            convert_to_numpy=True,
         )
-        all_embeddings.append(batch_embeddings)
+        embeddings[i:end_idx] = batch_embs
 
-        if (i // batch_size) % 20 == 0 or i + batch_size >= len(texts):
-            logger.info(f"  Processed {min(i + batch_size, len(texts)):,}/{len(texts):,} texts")
+        if (i // batch_size) % 50 == 0 or end_idx >= n_texts:
+            elapsed = time.time() - t0
+            rate = end_idx / elapsed if elapsed > 0 else 0
+            logger.info(f"  [{description}] {end_idx:,}/{n_texts:,} ({end_idx/n_texts*100:.1f}%) | {rate:.0f} texts/sec")
 
-    embeddings = np.vstack(all_embeddings)
-    logger.info(f"{description} complete. Shape: {embeddings.shape}")
     return embeddings
 
 
@@ -266,10 +271,12 @@ def build_faiss_index(embeddings: np.ndarray, use_gpu: bool = True) -> "faiss.In
     if use_gpu:
         try:
             res = faiss.StandardGpuResources()
+            # Set temp memory buffer to 1.5 GB to prevent allocation crashes on large vector pools
+            res.setTempMemory(1536 * 1024 * 1024)
             index = faiss.index_cpu_to_gpu(res, 0, index)
-            logger.info("FAISS index moved to GPU")
+            logger.info("FAISS index successfully moved to GPU with 1.5GB temp buffer")
         except Exception as e:
-            logger.warning(f"Could not move FAISS index to GPU: {e}. Using CPU index.")
+            logger.warning(f"Could not move FAISS index to GPU: {e}. Using multithreaded CPU index.")
 
     # Add vectors
     logger.info(f"Adding {len(embeddings):,} vectors to index...")
@@ -365,8 +372,8 @@ def main():
     parser.add_argument(
         "--top-k",
         type=int,
-        default=5,
-        help="Number of semantic candidates to retrieve per S1 entity"
+        default=15,
+        help="Number of semantic candidates to retrieve per S1 entity (default: 15, optimal for high recall)"
     )
     parser.add_argument(
         "--batch-size",
