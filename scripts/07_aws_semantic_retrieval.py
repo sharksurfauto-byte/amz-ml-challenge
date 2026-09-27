@@ -194,6 +194,64 @@ def encode_in_batches(model, texts: List[str], batch_size: int, description: str
     return embeddings
 
 
+class NativeTransformerEmbedder:
+    """
+    Native PyTorch + HuggingFace Transformers embedding engine.
+    Completely bypasses sentence-transformers and datasets packages to avoid
+    conda metadata incompatibilities in Python 3.12 (e.g. TF_VERSION NoneType bug).
+    """
+
+    def __init__(self, model_name: str):
+        from transformers import AutoTokenizer, AutoModel
+        import torch
+
+        hf_id = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
+        logger.info(f"Loading native HuggingFace model: {hf_id}...")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.tokenizer = AutoTokenizer.from_pretrained(hf_id)
+        self.model = AutoModel.from_pretrained(hf_id).to(self.device)
+        self.model.eval()
+        self.dim = self.model.config.hidden_size
+        logger.info(f"Native model loaded on {self.device}. Hidden dim: {self.dim}")
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return self.dim
+
+    def encode(
+        self,
+        texts: List[str],
+        batch_size: int = 512,
+        normalize_embeddings: bool = True,
+        show_progress_bar: bool = False,
+        convert_to_numpy: bool = True,
+    ) -> np.ndarray:
+        import torch
+        import torch.nn.functional as F
+
+        all_embs = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            encoded = self.tokenizer(
+                batch, padding=True, truncation=True, max_length=128, return_tensors="pt"
+            ).to(self.device)
+
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=(self.device.type == "cuda"), dtype=torch.bfloat16):
+                    out = self.model(**encoded)
+                    tok_embs = out[0]
+                    mask = encoded["attention_mask"].unsqueeze(-1).expand(tok_embs.size()).float()
+                    sum_embs = torch.sum(tok_embs * mask, 1)
+                    sum_mask = torch.clamp(mask.sum(1), min=1e-9)
+                    sent_embs = sum_embs / sum_mask
+
+                    if normalize_embeddings:
+                        sent_embs = F.normalize(sent_embs, p=2, dim=1)
+
+            all_embs.append(sent_embs.cpu().to(torch.float32).numpy())
+
+        return np.vstack(all_embs)
+
+
 def encode_with_multi_gpu(model, texts: List[str], batch_size: int, pool_size: int = None) -> np.ndarray:
     """
     Encode texts using multi-GPU parallelism with fallback.
@@ -418,13 +476,6 @@ def main():
     logger.info(f"Data dir: {args.data_dir}")
     logger.info(f"Output dir: {args.output_dir}")
 
-    # Load SentenceTransformer
-    try:
-        from sentence_transformers import SentenceTransformer
-    except ImportError:
-        logger.error("sentence-transformers not installed. Run: pip install sentence-transformers")
-        sys.exit(1)
-
     try:
         import faiss
         logger.info(f"FAISS version: {faiss.__version__}")
@@ -432,8 +483,17 @@ def main():
         logger.error("FAISS not installed. Run: pip install faiss-gpu (or faiss-cpu)")
         sys.exit(1)
 
-    logger.info(f"Loading SentenceTransformer model: {args.model_name}...")
-    model = SentenceTransformer(args.model_name)
+    # Load Model (try sentence-transformers first, fall back to native transformers on conda/datasets conflict)
+    try:
+        from sentence_transformers import SentenceTransformer
+        logger.info(f"Loading SentenceTransformer model: {args.model_name}...")
+        model = SentenceTransformer(args.model_name)
+    except Exception as e:
+        logger.warning(
+            f"SentenceTransformer import/init failed ({e}). "
+            f"Using native HuggingFace Transformers fallback..."
+        )
+        model = NativeTransformerEmbedder(args.model_name)
     logger.info(f"Model loaded. Embedding dimension: {model.get_sentence_embedding_dimension()}")
 
     # Load and prepare data
