@@ -282,19 +282,24 @@ def train_gbdt_ranker(
     gt_map = None
     if gt_path and gt_path.exists():
         logger.info("Loading ground truth file for full dev evaluation: %s", gt_path.name)
-        if gt_path.suffix == ".parquet":
-            gt_raw = pl.read_parquet(gt_path)
-        else:
-            gt_raw = pl.read_csv(gt_path, separator="\t", infer_schema_length=5000)
+        try:
+            if gt_path.suffix == ".parquet":
+                full_gt = pl.read_parquet(gt_path)
+            else:
+                full_gt = pl.read_csv(gt_path, separator="\t", infer_schema_length=5000)
 
-        s1_raw_col = "source1_entity_id" if "source1_entity_id" in gt_raw.columns else "entity_id"
-        if "matched_entity_ids" in gt_raw.columns:
-            gt_map = {}
-            for row in gt_raw.iter_rows(named=True):
-                s1_id_str = str(row[s1_raw_col])
-                if assign_entity_split(s1_id_str) == "dev":
+            s1_raw_col = "source1_entity_id" if "source1_entity_id" in full_gt.columns else "entity_id"
+            if "matched_entity_ids" in full_gt.columns:
+                dev_gt = add_deterministic_split(full_gt, id_col=s1_raw_col).filter(pl.col("split") == "dev")
+
+                gt_map = {}
+                for row in dev_gt.iter_rows(named=True):
+                    s1_id_str = str(row[s1_raw_col])
                     matches_str = row["matched_entity_ids"] or ""
                     gt_map[s1_id_str] = {x.strip() for x in matches_str.split(",") if x.strip()}
+        except Exception as e:
+            logger.warning("Failed to load or parse full dev ground truth: %s", e)
+            gt_map = None
 
     # 6. Optimize Probability Threshold for Macro F_0.5
     if fixed_threshold is not None:
@@ -398,7 +403,7 @@ def main():
     parser.add_argument(
         "--gt-path",
         type=Path,
-        default=None,
+        default=REPO_ROOT / "data/parquet/train/train_ground_truth.parquet",
         help="Optional path to ground truth table for comprehensive dev evaluation (includes singletons)",
     )
     parser.add_argument(
