@@ -161,8 +161,8 @@ def main():
     out_matches_path = args.out_dir / "matching_results.tsv"
     
     logger.info("Writing TSV files...")
-    candidate_pairs.write_csv(out_cands_path, separator="\t")
-    matching_results.write_csv(out_matches_path, separator="\t")
+    candidate_pairs.write_csv(out_cands_path, separator="\t", quote_style="never")
+    matching_results.write_csv(out_matches_path, separator="\t", quote_style="never")
     
     logger.info(f"Done! Evaluated test setup successfully.")
     logger.info(f"Run 'python scripts/validate_submission.py --matching {out_matches_path} --candidate {out_cands_path} --test-dir data/test' to verify format.")
